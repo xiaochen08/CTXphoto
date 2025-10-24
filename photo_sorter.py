@@ -1,10 +1,11 @@
-# 陈同学影像管理助手 v1.7.1
+# 陈同学影像管理助手 v1.7.2
 # 更新点：
 # - 开始/完成提示音
 # - 复制过程无弹窗；主界面显示进度与速度（MB/s）
 # - 进度条按字节比例；速度=累计字节/耗时
 # - 保留星标提取、撤销、主题切换、可拖动分割、稳定日志、容量显示修复、版权提示
 # - 弹窗统一 Aurora 风格并适配暗黑主题
+# - 新增 Aurora 风格文本输入弹窗，统一拍摄名称输入体验
 
 import os, sys, json, time, shutil, platform, subprocess, re
 import tkinter as tk
@@ -13,7 +14,7 @@ from datetime import datetime
 
 from types import SimpleNamespace
 
-VERSION = "v1.7.1"
+VERSION = "v1.7.2"
 CONFIG_FILE = "photo_sorter_config.json"
 CATEGORIES = ["婚礼", "写真", "日常记录", "旅游记录", "商业活动拍摄"]
 THEMES = ["暗黑"]
@@ -602,6 +603,14 @@ def apply_theme(root, theme_key, info_text_widget=None):
         arrowcolor=[("active", P["ACCENT"]), ("readonly", P["SUB"])],
     )
 
+    style.configure("Aurora.TEntry", fieldbackground=P["INPUT_BG"], foreground=P["INPUT_FG"], bordercolor=P["INPUT_BORDER"], padding=(12, 8))
+    style.map(
+        "Aurora.TEntry",
+        fieldbackground=[("focus", P["INPUT_BG"])],
+        bordercolor=[("focus", P["ACCENT_LINE"])],
+        foreground=[("disabled", P["SUB"])],
+    )
+
     style.configure("Aurora.TCheckbutton", background=P["CARD"], foreground=P["TEXT"], font=_font(11))
     style.map("Aurora.TCheckbutton", background=[("active", P["CARD_HIGHLIGHT"])], foreground=[("disabled", P["SUB"])])
 
@@ -744,6 +753,90 @@ def _aurora_modal(title, message, *, level="info", buttons, parent=None, default
     return result["value"]
 
 
+def aurora_askstring(title, prompt, *, parent=None, initialvalue=""):
+    toplevel = _normalize_parent(parent)
+    if not _can_use_modal(toplevel):
+        return simpledialog.askstring(title, prompt, parent=parent, initialvalue=initialvalue)
+
+    win = tk.Toplevel(toplevel)
+    win.withdraw()
+    win.title(title)
+    win.resizable(False, False)
+    win.transient(toplevel)
+    win.grab_set()
+    win.attributes("-topmost", True)
+
+    apply_theme(win, DEFAULT_THEME_KEY)
+    win.configure(bg=AURORA_THEME["HEADER_BG"])
+
+    accent = tk.Frame(win, bg=AURORA_THEME["ACCENT_LINE"], height=4, bd=0, highlightthickness=0)
+    accent.pack(fill="x")
+
+    container = ttk.Frame(win, style="AuroraCard.TFrame", padding=(28, 24))
+    container.pack(fill="both", expand=True)
+
+    title_label = ttk.Label(container, text=title, style="AuroraSection.TLabel")
+    title_label.pack(anchor="w")
+
+    body_label = ttk.Label(container, text=prompt, style="AuroraBody.TLabel", wraplength=440, justify="left")
+    body_label.pack(anchor="w", pady=(12, 0))
+
+    entry = tk.Entry(container, font=_font(12))
+    entry.insert(0, initialvalue or "")
+    entry.configure(
+        bg=AURORA_THEME["INPUT_BG"],
+        fg=AURORA_THEME["INPUT_FG"],
+        insertbackground=AURORA_THEME["ACCENT"],
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground=AURORA_THEME["INPUT_BORDER"],
+        highlightcolor=AURORA_THEME["ACCENT_LINE"],
+        selectbackground=AURORA_THEME["ACCENT"],
+        selectforeground="#071425",
+        insertwidth=2,
+    )
+    entry.pack(fill="x", pady=(18, 0))
+
+    result = {"value": None}
+
+    def submit():
+        result["value"] = entry.get()
+        win.destroy()
+
+    def cancel():
+        result["value"] = None
+        win.destroy()
+
+    btn_frame = ttk.Frame(container, style="AuroraCard.TFrame")
+    btn_frame.pack(anchor="e", pady=(24, 6))
+
+    btn_cancel = ttk.Button(btn_frame, text="取消", style="AuroraGhost.TButton", command=cancel)
+    btn_cancel.pack(side="right", padx=(12, 0))
+
+    btn_ok = ttk.Button(btn_frame, text="确认", style="AuroraPrimary.TButton", command=submit)
+    btn_ok.pack(side="right")
+
+    win.protocol("WM_DELETE_WINDOW", cancel)
+    win.bind("<Escape>", lambda _event: cancel())
+    win.bind("<Return>", lambda _event: submit())
+
+    win.update_idletasks()
+    if toplevel is not None:
+        toplevel.update_idletasks()
+        pw, ph = toplevel.winfo_width(), toplevel.winfo_height()
+        px, py = toplevel.winfo_rootx(), toplevel.winfo_rooty()
+        cw, ch = win.winfo_width(), win.winfo_height()
+        x = px + max((pw - cw) // 2, 0)
+        y = py + max((ph - ch) // 2, 0)
+        win.geometry(f"+{x}+{y}")
+
+    win.deiconify()
+    entry.focus_set()
+    entry.select_range(0, tk.END)
+    win.wait_window()
+    return result["value"]
+
+
 def aurora_showinfo(title, message, parent=None):
     toplevel = _normalize_parent(parent)
     if not _can_use_modal(toplevel):
@@ -870,7 +963,7 @@ def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_mai
     elif get_drive_type_code(src_drive)!=2:
         if not aurora_askyesno("固定磁盘警告",f"{src_drive} 为固定盘，通常应选移动盘。继续？", parent=root): return
 
-    shoot_name=simpledialog.askstring("本次拍摄名称","输入拍摄地点或主题（可中文）：",parent=root)
+    shoot_name=aurora_askstring("本次拍摄名称","输入拍摄地点或主题（可中文）：", parent=root, initialvalue="")
     if not shoot_name: return
 
     total_b,free_b=get_drive_usage_bytes(src_drive)
