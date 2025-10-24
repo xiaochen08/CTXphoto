@@ -17,24 +17,29 @@ CONFIG_FILE = "photo_sorter_config.json"
 CATEGORIES = ["婚礼", "写真", "日常记录", "旅游记录", "商业活动拍摄"]
 THEMES = ["日间", "暗黑"]
 
+SUPPRESS_RUNTIME_WARNINGS = any(arg in ("-h", "--help") for arg in sys.argv[1:])
+
 try:
     import psutil  # type: ignore
 except Exception:  # pragma: no cover - best effort fallback for limited environments
     psutil = None
-    print("[警告] 未检测到 psutil，部分磁盘信息功能将受限。", file=sys.stderr)
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 psutil，部分磁盘信息功能将受限。", file=sys.stderr)
 
 try:
     from PIL import Image, ExifTags
 except Exception:  # pragma: no cover - optional dependency fallback
     Image = None
     ExifTags = SimpleNamespace(TAGS={})
-    print("[警告] 未检测到 Pillow，EXIF 读取功能将受限。", file=sys.stderr)
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 Pillow，EXIF 读取功能将受限。", file=sys.stderr)
 
 try:
     import exifread
 except Exception:  # pragma: no cover - optional dependency fallback
     exifread = None
-    print("[警告] 未检测到 exifread，将使用文件修改时间作为拍摄时间。", file=sys.stderr)
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 exifread，将使用文件修改时间作为拍摄时间。", file=sys.stderr)
 
 try:
     import winsound
@@ -681,8 +686,12 @@ def _prompt_directory(prompt, allow_create=False):
         print("目录不存在，请重新输入。")
 
 
-def run_cli():
-    print("[提示] 检测到无图形显示环境，已切换到命令行模式。按 Ctrl+C 可随时中断。")
+def run_cli(reason=None):
+    if reason:
+        msg = f"[提示] {reason}，已切换到命令行模式。按 Ctrl+C 可随时中断。"
+    else:
+        msg = "[提示] 已切换到命令行模式。按 Ctrl+C 可随时中断。"
+    print(msg)
 
     try:
         src_root = None
@@ -823,11 +832,6 @@ def run_cli():
 
 # ---------- UI（分割窗可拖动） ----------
 def main_ui():
-    headless = (os.name != "nt" and not os.environ.get("DISPLAY"))
-    if headless:
-        run_cli()
-        return
-
     cfg = load_config()
     theme_key = cfg.get("theme","light")
     sash_ratio = float(cfg.get("sash_ratio", 0.55))
@@ -836,7 +840,7 @@ def main_ui():
         root = tk.Tk()
     except Exception:
         print("[提示] 无法初始化图形界面，自动切换到命令行模式。")
-        run_cli()
+        run_cli(reason="无法初始化图形界面")
         return
     root.title(f"陈同学影像管理助手  {VERSION}")
     root.geometry("1000x720")
@@ -976,5 +980,56 @@ def main_ui():
 
     root.mainloop()
 
-if __name__=="__main__":
+
+def print_usage():
+    print("""用法:
+  python photo_sorter.py [选项]
+
+选项:
+  -h, --help    显示此帮助信息并退出。
+  --cli         强制使用命令行模式。
+  --gui         即使在检测到可能的无显示环境时也尝试启动图形界面。
+
+默认行为:
+  若存在图形显示环境则启动图形界面，否则自动回退到命令行模式。
+""")
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if any(arg in ("-h", "--help") for arg in argv):
+        print_usage()
+        return 0
+
+    recognized = {"--cli", "--gui"}
+    unknown = [arg for arg in argv if arg not in recognized]
+    if unknown:
+        print(f"[错误] 未识别的参数：{' '.join(unknown)}")
+        print_usage()
+        return 1
+
+    force_cli = "--cli" in argv
+    force_gui = "--gui" in argv
+
+    if force_cli and force_gui:
+        print("[错误] --cli 与 --gui 不能同时使用。")
+        print_usage()
+        return 1
+
+    if force_cli:
+        run_cli(reason="根据命令行参数 --cli")
+        return 0
+
+    headless = (os.name != "nt" and not os.environ.get("DISPLAY"))
+    if headless and not force_gui:
+        run_cli(reason="检测到无图形显示环境")
+        return 0
+
     main_ui()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
