@@ -10,14 +10,31 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from datetime import datetime
 
+from types import SimpleNamespace
+
 VERSION = "v1.7.0"
 CONFIG_FILE = "photo_sorter_config.json"
 CATEGORIES = ["婚礼", "写真", "日常记录", "旅游记录", "商业活动拍摄"]
 THEMES = ["日间", "暗黑"]
 
-import psutil
-from PIL import Image, ExifTags
-import exifread
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - best effort fallback for limited environments
+    psutil = None
+    print("[警告] 未检测到 psutil，部分磁盘信息功能将受限。", file=sys.stderr)
+
+try:
+    from PIL import Image, ExifTags
+except Exception:  # pragma: no cover - optional dependency fallback
+    Image = None
+    ExifTags = SimpleNamespace(TAGS={})
+    print("[警告] 未检测到 Pillow，EXIF 读取功能将受限。", file=sys.stderr)
+
+try:
+    import exifread
+except Exception:  # pragma: no cover - optional dependency fallback
+    exifread = None
+    print("[警告] 未检测到 exifread，将使用文件修改时间作为拍摄时间。", file=sys.stderr)
 
 try:
     import winsound
@@ -46,7 +63,68 @@ def get_drive_type_code(letter):
 
 def drive_type_name(code): return {2:"移动",3:"固定",4:"网络",5:"光驱",6:"RAM"}.get(code,"未知")
 def is_system_drive(letter): return letter.upper().startswith(os.environ.get("SystemDrive","C:").upper())
-def list_drives(): return [p.device for p in psutil.disk_partitions(all=True) if os.path.exists(p.mountpoint)]
+def _disk_partitions(all=True):
+    if psutil is not None:
+        try:
+            return psutil.disk_partitions(all=all)
+        except Exception:
+            pass
+
+    parts = []
+    if os.name == "nt":
+        try:
+            import string
+
+            for letter in string.ascii_uppercase:
+                drive = f"{letter}:\\"
+                if os.path.exists(drive):
+                    parts.append(SimpleNamespace(device=drive, mountpoint=drive))
+        except Exception:
+            pass
+    else:
+        seen = set()
+        try:
+            with open("/proc/mounts", "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    segs = line.split()
+                    if len(segs) < 2:
+                        continue
+                    device, mountpoint = segs[0], segs[1]
+                    if any(mountpoint.startswith(prefix) for prefix in ("/proc", "/sys", "/run", "/dev", "/snap")):
+                        continue
+                    if mountpoint in seen:
+                        continue
+                    seen.add(mountpoint)
+                    parts.append(SimpleNamespace(device=device, mountpoint=mountpoint))
+        except Exception:
+            pass
+        if not parts:
+            parts.append(SimpleNamespace(device="/", mountpoint="/"))
+    return parts
+
+
+def list_drives():
+    drives = []
+    for part in _disk_partitions(all=True):
+        mount = getattr(part, "mountpoint", "")
+        device = getattr(part, "device", "")
+        if mount and not os.path.exists(mount):
+            continue
+        if os.name == "nt":
+            candidate = device.rstrip("\\") or mount.rstrip("\\")
+        else:
+            candidate = mount or device
+        if not candidate:
+            continue
+        drives.append(candidate)
+    if not drives and os.name != "nt":
+        drives.append("/")
+    # Preserve order while removing duplicates
+    seen = []
+    for d in drives:
+        if d not in seen:
+            seen.append(d)
+    return seen
 
 def get_drive_label(letter):
     import ctypes
@@ -60,7 +138,20 @@ def get_drive_label(letter):
     return name or "(无名称)"
 
 def get_drive_usage_bytes(root):
-    u=psutil.disk_usage(root); return u.total,u.free
+    path = root
+    if os.name == "nt":
+        if len(path) == 2 and path[1] == ":":
+            path = path + "\\"
+        elif len(path) == 3 and path[1] == ":" and path[2] in ("/", "\\"):
+            path = path[0:2] + "\\"
+    if psutil is not None:
+        try:
+            u = psutil.disk_usage(path)
+            return u.total, u.free
+        except Exception:
+            pass
+    total, used, free = shutil.disk_usage(path)
+    return total, free
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -85,6 +176,8 @@ def _parse_exif_str(s):
     return None
 
 def _exif_dt_from_jpg(p):
+    if Image is None:
+        return None
     try:
         im=Image.open(p); exif=im._getexif()
         if not exif: return None
@@ -98,6 +191,8 @@ def _exif_dt_from_jpg(p):
     return None
 
 def _exif_dt_from_any(p):
+    if exifread is None:
+        return None
     try:
         with open(p,"rb") as f: tags=exifread.process_file(f,stop_tag="EXIF DateTimeOriginal",details=False)
         for k in("EXIF DateTimeOriginal","Image DateTime","EXIF DateTimeDigitized"):
@@ -428,13 +523,30 @@ def refresh_sources(info_box, combo_src, auto_pick=False):
 
 def refresh_dests(info_box, combo_dst):
     vals=[]
-    for p in psutil.disk_partitions(all=False):
-        letter=p.device.rstrip("\\")
-        if get_drive_type_code(letter)!=3: continue
-        total,free=get_drive_usage_bytes(letter+"\\"); label=get_drive_label(letter)
+    for part in _disk_partitions(all=False):
+        mount = getattr(part, "mountpoint", "")
+        device = getattr(part, "device", "")
+        if os.name == "nt":
+            letter = device.rstrip("\\") or mount.rstrip("\\")
+            if not letter:
+                continue
+            if get_drive_type_code(letter) != 3:
+                continue
+            label = get_drive_label(letter)
+            usage_key = letter
+        else:
+            letter = mount or device
+            if not letter:
+                continue
+            label = os.path.basename(letter) or letter
+            usage_key = letter
+        try:
+            total,free=get_drive_usage_bytes(usage_key)
+        except Exception:
+            continue
         vals.append(f"{letter} {label}（{bytes_to_human(free)} / {bytes_to_human(total)}）")
     combo_dst["values"]=vals
-    log_add(info_box,"已刷新目标固定磁盘列表")
+    log_add(info_box, "已刷新目标固定磁盘列表" if vals else "未检测到目标固定磁盘")
 
 # ---------- 复制入口 ----------
 def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_main, status_lbl, extract_star=False):
@@ -469,7 +581,11 @@ def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_mai
         "照片重命名：MMDD-0001 起；视频保留原名。"):
         log_add(info_box,"用户取消复制"); return
 
-    if dst_letter: target_root=dst_letter+"\\"
+    if dst_letter:
+        if os.name == "nt" and not dst_letter.endswith("\\"):
+            target_root = dst_letter + "\\"
+        else:
+            target_root = dst_letter
     else:
         target_root=cfg.get("last_target_root","")
         if not os.path.exists(target_root):
@@ -488,7 +604,8 @@ def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_mai
     log_add(info_box,f"目标目录：{target_dir}")
 
     try:
-        _,dst_free=get_drive_usage_bytes(os.path.splitdrive(target_root)[0]+"\\")
+        usage_key = dst_letter or target_root
+        _,dst_free=get_drive_usage_bytes(usage_key)
         if dst_free<total_size:
             log_add(info_box,f"目标剩余 {bytes_to_human(dst_free)} < 需要 {bytes_to_human(total_size)}")
             if not messagebox.askretrycancel("空间不足",
@@ -531,6 +648,10 @@ def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_mai
 
 # ---------- UI（分割窗可拖动） ----------
 def main_ui():
+    if os.name != "nt" and not os.environ.get("DISPLAY"):
+        print("[错误] 未检测到图形显示环境，无法启动 Tkinter 界面。", file=sys.stderr)
+        return
+
     cfg = load_config()
     theme_key = cfg.get("theme","light")
     sash_ratio = float(cfg.get("sash_ratio", 0.55))
