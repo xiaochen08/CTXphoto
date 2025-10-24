@@ -10,14 +10,36 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from datetime import datetime
 
+from types import SimpleNamespace
+
 VERSION = "v1.7.0"
 CONFIG_FILE = "photo_sorter_config.json"
 CATEGORIES = ["婚礼", "写真", "日常记录", "旅游记录", "商业活动拍摄"]
 THEMES = ["日间", "暗黑"]
 
-import psutil
-from PIL import Image, ExifTags
-import exifread
+SUPPRESS_RUNTIME_WARNINGS = any(arg in ("-h", "--help") for arg in sys.argv[1:])
+
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - best effort fallback for limited environments
+    psutil = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 psutil，部分磁盘信息功能将受限。", file=sys.stderr)
+
+try:
+    from PIL import Image, ExifTags
+except Exception:  # pragma: no cover - optional dependency fallback
+    Image = None
+    ExifTags = SimpleNamespace(TAGS={})
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 Pillow，EXIF 读取功能将受限。", file=sys.stderr)
+
+try:
+    import exifread
+except Exception:  # pragma: no cover - optional dependency fallback
+    exifread = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 exifread，将使用文件修改时间作为拍摄时间。", file=sys.stderr)
 
 try:
     import winsound
@@ -46,7 +68,68 @@ def get_drive_type_code(letter):
 
 def drive_type_name(code): return {2:"移动",3:"固定",4:"网络",5:"光驱",6:"RAM"}.get(code,"未知")
 def is_system_drive(letter): return letter.upper().startswith(os.environ.get("SystemDrive","C:").upper())
-def list_drives(): return [p.device for p in psutil.disk_partitions(all=True) if os.path.exists(p.mountpoint)]
+def _disk_partitions(all=True):
+    if psutil is not None:
+        try:
+            return psutil.disk_partitions(all=all)
+        except Exception:
+            pass
+
+    parts = []
+    if os.name == "nt":
+        try:
+            import string
+
+            for letter in string.ascii_uppercase:
+                drive = f"{letter}:\\"
+                if os.path.exists(drive):
+                    parts.append(SimpleNamespace(device=drive, mountpoint=drive))
+        except Exception:
+            pass
+    else:
+        seen = set()
+        try:
+            with open("/proc/mounts", "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    segs = line.split()
+                    if len(segs) < 2:
+                        continue
+                    device, mountpoint = segs[0], segs[1]
+                    if any(mountpoint.startswith(prefix) for prefix in ("/proc", "/sys", "/run", "/dev", "/snap")):
+                        continue
+                    if mountpoint in seen:
+                        continue
+                    seen.add(mountpoint)
+                    parts.append(SimpleNamespace(device=device, mountpoint=mountpoint))
+        except Exception:
+            pass
+        if not parts:
+            parts.append(SimpleNamespace(device="/", mountpoint="/"))
+    return parts
+
+
+def list_drives():
+    drives = []
+    for part in _disk_partitions(all=True):
+        mount = getattr(part, "mountpoint", "")
+        device = getattr(part, "device", "")
+        if mount and not os.path.exists(mount):
+            continue
+        if os.name == "nt":
+            candidate = device.rstrip("\\") or mount.rstrip("\\")
+        else:
+            candidate = mount or device
+        if not candidate:
+            continue
+        drives.append(candidate)
+    if not drives and os.name != "nt":
+        drives.append("/")
+    # Preserve order while removing duplicates
+    seen = []
+    for d in drives:
+        if d not in seen:
+            seen.append(d)
+    return seen
 
 def get_drive_label(letter):
     import ctypes
@@ -60,7 +143,20 @@ def get_drive_label(letter):
     return name or "(无名称)"
 
 def get_drive_usage_bytes(root):
-    u=psutil.disk_usage(root); return u.total,u.free
+    path = root
+    if os.name == "nt":
+        if len(path) == 2 and path[1] == ":":
+            path = path + "\\"
+        elif len(path) == 3 and path[1] == ":" and path[2] in ("/", "\\"):
+            path = path[0:2] + "\\"
+    if psutil is not None:
+        try:
+            u = psutil.disk_usage(path)
+            return u.total, u.free
+        except Exception:
+            pass
+    total, used, free = shutil.disk_usage(path)
+    return total, free
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -85,6 +181,8 @@ def _parse_exif_str(s):
     return None
 
 def _exif_dt_from_jpg(p):
+    if Image is None:
+        return None
     try:
         im=Image.open(p); exif=im._getexif()
         if not exif: return None
@@ -98,6 +196,8 @@ def _exif_dt_from_jpg(p):
     return None
 
 def _exif_dt_from_any(p):
+    if exifread is None:
+        return None
     try:
         with open(p,"rb") as f: tags=exifread.process_file(f,stop_tag="EXIF DateTimeOriginal",details=False)
         for k in("EXIF DateTimeOriginal","Image DateTime","EXIF DateTimeDigitized"):
@@ -157,12 +257,18 @@ def unique_path(d,f):
 
 # ---------- 日志 ----------
 def log_init_if_empty(text_widget, line):
+    if text_widget is None:
+        print(f"[{ts()}] {line}")
+        return
     if float(text_widget.index("end-1c"))==1.0:
         text_widget.configure(state="normal")
         text_widget.insert("end", f"[{ts()}] {line}\n")
         text_widget.configure(state="disabled")
 
 def log_add(text_widget, line):
+    if text_widget is None:
+        print(f"[{ts()}] {line}")
+        return
     text_widget.configure(state="normal")
     text_widget.insert("end", f"[{ts()}] {line}\n")
     text_widget.see("end")
@@ -275,7 +381,7 @@ def center_on_parent(child: tk.Toplevel, parent: tk.Tk):
     child.geometry(f"+{x}+{y}")
 
 # ---------- 复制（主界面进度，MB/s，含星标） ----------
-def copy_with_progress_seq_and_video(src_files, dst, pb, status_label, log_file, mmdd_str, info_box, total_bytes, extract_star=False):
+def copy_with_progress_seq_and_video(src_files, dst, pb, status_label, log_file, mmdd_str, info_box, total_bytes, extract_star=False, progress_hook=None):
     created=[]; done=set()
     if os.path.exists(log_file):
         with open(log_file,"r",encoding="utf-8") as f:
@@ -304,9 +410,16 @@ def copy_with_progress_seq_and_video(src_files, dst, pb, status_label, log_file,
         elapsed = max(time.time()-t0, 1e-6)
         speed_mb = bytes_done / elapsed / (1024*1024)
         pct = (bytes_done/total_bytes*100) if total_bytes>0 else 0
-        pb["value"] = min(max(pct,0),100)
-        label.config(text=f"{phase} | {bytes_to_human(bytes_done)} / {bytes_to_human(total_bytes)} | 速度 {speed_mb:.2f} MB/s")
-        label.update()
+        if pb is not None:
+            pb["value"] = min(max(pct,0),100)
+        if label is not None:
+            label.config(text=f"{phase} | {bytes_to_human(bytes_done)} / {bytes_to_human(total_bytes)} | 速度 {speed_mb:.2f} MB/s")
+            label.update()
+        if progress_hook is not None:
+            try:
+                progress_hook(phase, bytes_done, total_bytes, speed_mb)
+            except Exception:
+                pass
 
     # 照片复制与重命名
     for src,base,ext in plan:
@@ -428,13 +541,30 @@ def refresh_sources(info_box, combo_src, auto_pick=False):
 
 def refresh_dests(info_box, combo_dst):
     vals=[]
-    for p in psutil.disk_partitions(all=False):
-        letter=p.device.rstrip("\\")
-        if get_drive_type_code(letter)!=3: continue
-        total,free=get_drive_usage_bytes(letter+"\\"); label=get_drive_label(letter)
+    for part in _disk_partitions(all=False):
+        mount = getattr(part, "mountpoint", "")
+        device = getattr(part, "device", "")
+        if os.name == "nt":
+            letter = device.rstrip("\\") or mount.rstrip("\\")
+            if not letter:
+                continue
+            if get_drive_type_code(letter) != 3:
+                continue
+            label = get_drive_label(letter)
+            usage_key = letter
+        else:
+            letter = mount or device
+            if not letter:
+                continue
+            label = os.path.basename(letter) or letter
+            usage_key = letter
+        try:
+            total,free=get_drive_usage_bytes(usage_key)
+        except Exception:
+            continue
         vals.append(f"{letter} {label}（{bytes_to_human(free)} / {bytes_to_human(total)}）")
     combo_dst["values"]=vals
-    log_add(info_box,"已刷新目标固定磁盘列表")
+    log_add(info_box, "已刷新目标固定磁盘列表" if vals else "未检测到目标固定磁盘")
 
 # ---------- 复制入口 ----------
 def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_main, status_lbl, extract_star=False):
@@ -469,7 +599,11 @@ def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_mai
         "照片重命名：MMDD-0001 起；视频保留原名。"):
         log_add(info_box,"用户取消复制"); return
 
-    if dst_letter: target_root=dst_letter+"\\"
+    if dst_letter:
+        if os.name == "nt" and not dst_letter.endswith("\\"):
+            target_root = dst_letter + "\\"
+        else:
+            target_root = dst_letter
     else:
         target_root=cfg.get("last_target_root","")
         if not os.path.exists(target_root):
@@ -488,7 +622,8 @@ def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_mai
     log_add(info_box,f"目标目录：{target_dir}")
 
     try:
-        _,dst_free=get_drive_usage_bytes(os.path.splitdrive(target_root)[0]+"\\")
+        usage_key = dst_letter or target_root
+        _,dst_free=get_drive_usage_bytes(usage_key)
         if dst_free<total_size:
             log_add(info_box,f"目标剩余 {bytes_to_human(dst_free)} < 需要 {bytes_to_human(total_size)}")
             if not messagebox.askretrycancel("空间不足",
@@ -529,13 +664,184 @@ def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_mai
     beep_done()
     show_finish_and_undo(root, target_dir, created)
 
+# ---------- CLI 模式 ----------
+def _prompt_directory(prompt, allow_create=False):
+    while True:
+        try:
+            raw = input(prompt).strip().strip('"')
+        except EOFError:
+            return None
+        if not raw:
+            print("输入不能为空，请重新输入。")
+            continue
+        path = os.path.abspath(raw)
+        if os.path.isdir(path):
+            return path
+        if allow_create:
+            try:
+                os.makedirs(path, exist_ok=True)
+                return path
+            except Exception as exc:
+                print(f"创建目录失败：{exc}")
+        print("目录不存在，请重新输入。")
+
+
+def run_cli(reason=None):
+    if reason:
+        msg = f"[提示] {reason}，已切换到命令行模式。按 Ctrl+C 可随时中断。"
+    else:
+        msg = "[提示] 已切换到命令行模式。按 Ctrl+C 可随时中断。"
+    print(msg)
+
+    try:
+        src_root = None
+        while src_root is None:
+            src_root = _prompt_directory("请输入素材所在的文件夹路径：")
+            if src_root is None:
+                print("未获得有效路径，已退出。")
+                return
+            counts, sizes, files = preflight_scan(src_root)
+            total_files = counts["RAW"] + counts["JPG"] + counts["VIDEO"]
+            total_size = sizes["RAW"] + sizes["JPG"] + sizes["VIDEO"]
+            if total_files == 0:
+                print("该目录内未检测到可处理的照片或视频，请重新选择。")
+                src_root = None
+
+        dst_root = _prompt_directory("请输入导入目标根目录（例如备份硬盘）：", allow_create=True)
+        if dst_root is None:
+            print("未获得有效目标目录，已退出。")
+            return
+
+        print("可选拍摄类型：")
+        for idx, name in enumerate(CATEGORIES, 1):
+            print(f"  {idx}. {name}")
+        while True:
+            try:
+                sel = input("请选择拍摄类型（输入序号，默认 1）：").strip()
+            except EOFError:
+                print("未获得输入，已退出。")
+                return
+            if not sel:
+                category = CATEGORIES[0]
+                break
+            if sel.isdigit() and 1 <= int(sel) <= len(CATEGORIES):
+                category = CATEGORIES[int(sel)-1]
+                break
+            print("输入无效，请重新输入。")
+
+        default_name = os.path.basename(os.path.normpath(src_root)) or "作品"
+        try:
+            shoot_name = input(f"请输入拍摄主题（默认：{default_name}）：").strip()
+        except EOFError:
+            print("未获得输入，已退出。")
+            return
+        if not shoot_name:
+            shoot_name = default_name
+
+        try:
+            star_answer = input("是否提取星标照片？(y/N)：").strip().lower()
+        except EOFError:
+            star_answer = ""
+        extract_star = star_answer in {"y", "yes", "是"}
+
+        print("\n预检结果：")
+        print(f"  RAW: {counts['RAW']} 张，共 {bytes_to_human(sizes['RAW'])}")
+        print(f"  JPG: {counts['JPG']} 张，共 {bytes_to_human(sizes['JPG'])}")
+        print(f"  VIDEO: {counts['VIDEO']} 个，共 {bytes_to_human(sizes['VIDEO'])}")
+        total_size = sizes["RAW"] + sizes["JPG"] + sizes["VIDEO"]
+        print(f"  总计：{total_files} 个文件，约 {bytes_to_human(total_size)}")
+
+        today = datetime.now()
+        year_dir = os.path.join(dst_root, f"{today.year}")
+        cat_dir = os.path.join(year_dir, category)
+        month_dir = os.path.join(cat_dir, f"{today.month:02d}月")
+        day_folder = f"{today.month:02d}.{today.day:02d}_{shoot_name}"
+        target_dir = os.path.join(month_dir, day_folder)
+        os.makedirs(target_dir, exist_ok=True)
+
+        try:
+            usage_key = dst_root
+            _, dst_free = get_drive_usage_bytes(usage_key)
+        except Exception:
+            dst_free = None
+        if dst_free is not None and dst_free < total_size:
+            print(f"[警告] 目标磁盘剩余 {bytes_to_human(dst_free)}，低于预计需要的 {bytes_to_human(total_size)}。")
+            try:
+                cont = input("是否继续？(y/N)：").strip().lower()
+            except EOFError:
+                cont = ""
+            if cont not in {"y", "yes", "是"}:
+                print("用户取消导入。")
+                return
+
+        print(f"\n导入目标目录：{target_dir}")
+        log_file = os.path.join(target_dir, "copy_log.txt")
+        mmdd_str = f"{today.month:02d}{today.day:02d}"
+
+        print("开始复制，请稍候…")
+        beep_start()
+
+        last_emit = 0.0
+
+        def progress_hook(phase, done_bytes, total_bytes, speed_mb):
+            nonlocal last_emit
+            now = time.time()
+            if now - last_emit < 0.5 and done_bytes < total_bytes:
+                return
+            pct = (done_bytes / total_bytes * 100) if total_bytes else 0.0
+            print(f"[{ts()}] {phase} {pct:5.1f}% | {bytes_to_human(done_bytes)} / {bytes_to_human(total_bytes)} | 速度 {speed_mb:.2f} MB/s", end="\r" if done_bytes < total_bytes else "\n")
+            last_emit = now
+
+        created = []
+        try:
+            created = copy_with_progress_seq_and_video(
+                files, target_dir, None, None, log_file, mmdd_str, None,
+                total_bytes=total_size, extract_star=extract_star, progress_hook=progress_hook
+            )
+        except KeyboardInterrupt:
+            print("\n用户中断，正在清理未完成的复制文件…")
+            for p in created:
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+            return
+
+        print("\n复制完成！")
+        beep_done()
+        print(f"本次共生成 {len(created)} 个文件。")
+
+        ts2 = datetime.now().strftime("%Y%m%d_%H%M%S")
+        manifest_path = os.path.join(target_dir, f"import_manifest_{ts2}.json")
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "version": VERSION,
+                "created_at": ts2,
+                "source": src_root,
+                "target_dir": target_dir,
+                "category": category,
+                "files": created,
+                "extract_star": extract_star,
+            }, f, ensure_ascii=False, indent=2)
+        print(f"导入清单已保存：{manifest_path}")
+        print("感谢使用命令行模式。")
+    except KeyboardInterrupt:
+        print("\n用户取消操作。")
+
+
 # ---------- UI（分割窗可拖动） ----------
 def main_ui():
     cfg = load_config()
     theme_key = cfg.get("theme","light")
     sash_ratio = float(cfg.get("sash_ratio", 0.55))
 
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except Exception:
+        print("[提示] 无法初始化图形界面，自动切换到命令行模式。")
+        run_cli(reason="无法初始化图形界面")
+        return
     root.title(f"陈同学影像管理助手  {VERSION}")
     root.geometry("1000x720")
     root.minsize(860, 600)
@@ -674,5 +980,56 @@ def main_ui():
 
     root.mainloop()
 
-if __name__=="__main__":
+
+def print_usage():
+    print("""用法:
+  python photo_sorter.py [选项]
+
+选项:
+  -h, --help    显示此帮助信息并退出。
+  --cli         强制使用命令行模式。
+  --gui         即使在检测到可能的无显示环境时也尝试启动图形界面。
+
+默认行为:
+  若存在图形显示环境则启动图形界面，否则自动回退到命令行模式。
+""")
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if any(arg in ("-h", "--help") for arg in argv):
+        print_usage()
+        return 0
+
+    recognized = {"--cli", "--gui"}
+    unknown = [arg for arg in argv if arg not in recognized]
+    if unknown:
+        print(f"[错误] 未识别的参数：{' '.join(unknown)}")
+        print_usage()
+        return 1
+
+    force_cli = "--cli" in argv
+    force_gui = "--gui" in argv
+
+    if force_cli and force_gui:
+        print("[错误] --cli 与 --gui 不能同时使用。")
+        print_usage()
+        return 1
+
+    if force_cli:
+        run_cli(reason="根据命令行参数 --cli")
+        return 0
+
+    headless = (os.name != "nt" and not os.environ.get("DISPLAY"))
+    if headless and not force_gui:
+        run_cli(reason="检测到无图形显示环境")
+        return 0
+
     main_ui()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
