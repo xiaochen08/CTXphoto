@@ -1,0 +1,61 @@
+{
+	"publisher": "gooooloo",
+	"name": "smartquote",
+	"displayName": "中文引号修正",
+	"description": "自动修正错乱的中文引号，使之依次成对出现",
+	"version": "0.0.2",
+	"engines": {
+		"vscode": "^1.52.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"activationEvents": [
+		"*"
+	],
+	"main": "./out/extension.js",
+	"contributes": {
+		"commands": [
+			{
+				"command": "smartquote.smart_quote",
+				"title": "Smart Quote"
+			}
+		]
+	},
+	"scripts": {
+		"vscode:prepublish": "npm run compile",
+		"compile": "tsc -p ./",
+		"watch": "tsc -watch -p ./",
+		"pretest": "npm run compile && npm run lint",
+		"lint": "eslint src --ext ts",
+		"test": "node ./out/test/runTest.js"
+	},
+	"devDependencies": {
+		"@types/vscode": "^1.52.0",
+		"@types/glob": "^7.1.3",
+		"@types/mocha": "^8.0.4",
+		"@types/node": "^12.11.7",
+		"eslint": "^7.15.0",
+		"@typescript-eslint/eslint-plugin": "^4.9.0",
+		"@typescript-eslint/parser": "^4.9.0",
+		"glob": "^7.1.6",
+		"mocha": "^8.1.3",
+		"typescript": "^4.1.2",
+		"vscode-test": "^1.4.1"
+	},
+	"license": "MIT",
+	"bugs": {
+		"url": "https://github.com/gooooloo/vscode-smartquote/issues",
+		"email": "qidu.lin.dev@gmail.com"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/gooooloo/vscode-smartquote.git"
+	},
+	"homepage": "https://github.com/gooooloo/vscode-smartquote/blob/master/README.md",
+	"__metadata": {
+		"installedTimestamp": 1761151286012,
+		"targetPlatform": "undefined",
+		"size": 2155518
+	}
+}
