@@ -1,4 +1,4 @@
-# 陈同学影像管理助手 v1.7.2
+# 陈同学影像管理助手 v1.7.3
 # 更新点：
 # - 开始/完成提示音
 # - 复制过程无弹窗；主界面显示进度与速度（MB/s）
@@ -6,6 +6,7 @@
 # - 保留星标提取、撤销、主题切换、可拖动分割、稳定日志、容量显示修复、版权提示
 # - 弹窗统一 Aurora 风格并适配暗黑主题
 # - 新增 Aurora 风格文本输入弹窗，统一拍摄名称输入体验
+# - 进度条升级为圆角凹槽并新增百分比显示，支持快速打开当月目录与星标按钮状态提示
 
 import os, sys, json, time, shutil, platform, subprocess, re, threading
 import tkinter as tk
@@ -14,7 +15,7 @@ from datetime import datetime
 
 from types import SimpleNamespace
 
-VERSION = "v1.7.2"
+VERSION = "v1.7.3"
 CONFIG_FILE = "photo_sorter_config.json"
 CATEGORIES = ["婚礼", "写真", "日常记录", "旅游记录", "商业活动拍摄"]
 THEMES = ["暗黑"]
@@ -311,6 +312,38 @@ def rollback_files(paths, target_root):
             pass
     return removed
 
+
+def remove_daily_folder_tree(target_dir, copy_date):
+    removed = []
+    try:
+        target_root = os.path.abspath(os.path.join(target_dir, "..", "..", "..", ".."))
+    except Exception:
+        return removed
+    if not os.path.isdir(target_root):
+        return removed
+    month_cn = os.path.join(target_root, f"{copy_date.year}年{copy_date.month:02d}月")
+    day_cn = os.path.join(month_cn, f"{copy_date.month:02d}月{copy_date.day:02d}日")
+    try:
+        if os.path.isdir(day_cn):
+            try:
+                if os.path.commonpath([target_root, day_cn]) == target_root:
+                    shutil.rmtree(day_cn)
+            except Exception:
+                shutil.rmtree(day_cn, ignore_errors=True)
+            if not os.path.isdir(day_cn):
+                removed.append(day_cn)
+    except Exception:
+        pass
+    try:
+        if os.path.isdir(month_cn) and os.path.commonpath([target_root, month_cn]) == target_root:
+            if not os.listdir(month_cn):
+                os.rmdir(month_cn)
+        if not os.path.isdir(month_cn):
+            removed.append(month_cn)
+    except Exception:
+        pass
+    return removed
+
 # ---------- 扫描/计划 ----------
 def preflight_scan(src_root):
     counts={"RAW":0,"JPG":0,"VIDEO":0}; sizes={"RAW":0,"JPG":0,"VIDEO":0}
@@ -350,7 +383,7 @@ def _open_folder(p):
     except Exception:
         pass
 
-def show_finish_and_undo(root, target_dir, created_files):
+def show_finish_and_undo(root, target_dir, created_files, copy_date):
     win = tk.Toplevel(root)
     win.title("完成")
     win.resizable(False, False)
@@ -405,7 +438,12 @@ def show_finish_and_undo(root, target_dir, created_files):
         try:
             if os.path.isdir(target_dir) and not os.listdir(target_dir): os.rmdir(target_dir)
         except Exception: pass
-        aurora_showinfo("撤销完成", f"已删除本次导入生成的 {removed} 个文件。", parent=win)
+        extra_removed = remove_daily_folder_tree(target_dir, copy_date)
+        msg = f"已删除本次导入生成的 {removed} 个文件。"
+        if extra_removed:
+            detail = "\n".join(extra_removed)
+            msg += f"\n已删除目录：\n{detail}"
+        aurora_showinfo("撤销完成", msg, parent=win)
         win.destroy()
 
     ttk.Button(container, text="打开输出文件夹", style="AuroraPrimary.TButton", command=_open)\
@@ -665,6 +703,111 @@ def _font(size, weight="normal"):
     if weight == "bold":
         return ("Microsoft YaHei UI", size, "bold")
     return ("Microsoft YaHei UI", size)
+
+
+class AuroraProgressBar(ttk.Frame):
+    def __init__(self, master, height=14, **kwargs):
+        super().__init__(master, **kwargs)
+        self._height = height
+        self._radius = height / 2
+        self._value = 0.0
+        self._width = 0
+        self.canvas = tk.Canvas(
+            self,
+            height=height,
+            bd=0,
+            highlightthickness=0,
+            relief="flat",
+            bg=AURORA_THEME["CARD"],
+        )
+        self.canvas.pack(fill="both", expand=True)
+        self._trough = None
+        self._bar = None
+        self._shine = None
+        self.bind("<Configure>", self._on_resize)
+
+    def _rounded_points(self, x1, y1, x2, y2, radius):
+        r = max(0.0, min(radius, (x2 - x1) / 2.0, (y2 - y1) / 2.0))
+        if r <= 0:
+            return [x1, y1, x2, y1, x2, y2, x1, y2]
+        return [
+            x1 + r,
+            y1,
+            x2 - r,
+            y1,
+            x2,
+            y1,
+            x2,
+            y1 + r,
+            x2,
+            y2 - r,
+            x2,
+            y2,
+            x2 - r,
+            y2,
+            x1 + r,
+            y2,
+            x1,
+            y2,
+            x1,
+            y2 - r,
+            x1,
+            y1 + r,
+            x1,
+            y1,
+        ]
+
+    def _draw_trough(self):
+        if self._trough is not None:
+            self.canvas.delete(self._trough)
+        points = self._rounded_points(2, 2, self._width - 2, self._height - 2, self._radius)
+        self._trough = self.canvas.create_polygon(
+            *points,
+            smooth=True,
+            splinesteps=36,
+            fill=AURORA_THEME["TROUGH"],
+            outline=AURORA_THEME["CARD_BORDER"],
+            width=1,
+        )
+
+    def _ensure_bar(self):
+        if self._bar is None:
+            self._bar = self.canvas.create_polygon(0, 0, 0, 0, fill=AURORA_THEME["ACCENT"], outline="", smooth=True)
+        if self._shine is None:
+            self._shine = self.canvas.create_polygon(0, 0, 0, 0, fill=AURORA_THEME["ACCENT_HOVER"], outline="", smooth=True, stipple="gray25")
+
+    def _set_bar_width(self, width):
+        self._ensure_bar()
+        if width <= 0:
+            self.canvas.itemconfigure(self._bar, state="hidden")
+            self.canvas.itemconfigure(self._shine, state="hidden")
+            return
+        effective = max(0.0, min(width, self._width - 4))
+        r = min(self._radius, effective / 2.0)
+        points = self._rounded_points(2, 2, 2 + effective, self._height - 2, r)
+        self.canvas.coords(self._bar, *points)
+        self.canvas.coords(self._shine, *points)
+        self.canvas.itemconfigure(self._bar, state="normal")
+        self.canvas.itemconfigure(self._shine, state="normal")
+
+    def set_value(self, value):
+        self._value = max(0.0, min(100.0, float(value)))
+        if self._width <= 0:
+            return
+        fill_width = (self._width - 4) * (self._value / 100.0)
+        self._set_bar_width(fill_width)
+
+    def reset(self):
+        self.set_value(0.0)
+
+    def _on_resize(self, event):
+        new_width = max(event.width, 20)
+        if abs(new_width - self._width) < 1:
+            return
+        self._width = new_width
+        self.canvas.config(width=new_width)
+        self._draw_trough()
+        self.set_value(self._value)
 
 
 def apply_theme(root, theme_key, info_text_widget=None):
@@ -1109,7 +1252,9 @@ def start_copy(
     status_lbl,
     pause_btn,
     cancel_btn,
+    star_btn,
     state,
+    progress_var=None,
     extract_star=False,
 ):
     if state.is_copying:
@@ -1184,6 +1329,12 @@ def start_copy(
     day_folder = f"{today.month:02d}.{today.day:02d}_{shoot_name}"
     target_dir = os.path.join(month_dir, day_folder)
     os.makedirs(target_dir, exist_ok=True)
+    month_cn_dir = os.path.join(target_root, f"{today.year}年{today.month:02d}月")
+    day_cn_dir = os.path.join(month_cn_dir, f"{today.month:02d}月{today.day:02d}日")
+    try:
+        os.makedirs(day_cn_dir, exist_ok=True)
+    except Exception:
+        pass
     log_add(info_box, f"目标目录：{target_dir}")
 
     try:
@@ -1203,8 +1354,9 @@ def start_copy(
     log_file = os.path.join(target_dir, "copy_log.txt")
     mmdd_str = f"{today.month:02d}{today.day:02d}"
 
-    pb_main["value"] = 0
-    pb_main["maximum"] = 100
+    pb_main.reset()
+    if progress_var is not None:
+        progress_var.set("进度：0%")
     status_lbl.config(text="准备复制…")
     root.update_idletasks()
 
@@ -1214,6 +1366,7 @@ def start_copy(
     btn_start.configure(state="disabled")
     pause_btn.config(state="disabled", text="暂停")
     cancel_btn.config(state="disabled")
+    star_btn.config(state="disabled")
 
     state.is_copying = True
     state.is_paused = False
@@ -1229,7 +1382,10 @@ def start_copy(
             if not state.is_copying:
                 return
             pct = (done_bytes / total * 100) if total else (100 if phase == "收尾" else 0)
-            pb_main["value"] = max(0, min(100, pct))
+            pct = max(0.0, min(100.0, pct))
+            pb_main.set_value(pct)
+            if progress_var is not None:
+                progress_var.set(f"进度：{pct:.0f}%")
             status_lbl.config(
                 text=f"{phase} | {bytes_to_human(done_bytes)} / {bytes_to_human(total)} | 速度 {speed_mb:.2f} MB/s"
             )
@@ -1243,6 +1399,7 @@ def start_copy(
         cancelled = False
         error = None
         manifest_path = None
+        removed_dirs = []
         try:
             created = copy_with_progress_seq_and_video(
                 files,
@@ -1270,6 +1427,7 @@ def start_copy(
 
         if cancelled or error is not None:
             removed = rollback_files(list(state.copied_paths), target_dir)
+            removed_dirs.extend(remove_daily_folder_tree(target_dir, today))
         else:
             removed = 0
             ts2 = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1298,27 +1456,41 @@ def start_copy(
             btn_start.configure(state="normal")
             pause_btn.config(state="disabled", text="暂停")
             cancel_btn.config(state="disabled")
+            star_btn.config(state="normal")
 
             if cancelled:
-                pb_main["value"] = 0
+                pb_main.reset()
+                if progress_var is not None:
+                    progress_var.set("进度：0%")
                 status_lbl.config(text="已取消")
                 log_add(info_box, "已取消并回滚")
                 if removed:
                     log_add(info_box, f"已清理 {removed} 个文件")
+                if removed_dirs:
+                    for d in removed_dirs:
+                        log_add(info_box, f"已删除目录：{d}")
             elif error is not None:
+                pb_main.reset()
+                if progress_var is not None:
+                    progress_var.set("进度：0%")
                 status_lbl.config(text="复制失败")
                 log_add(info_box, f"复制失败：{error}")
                 if removed:
                     log_add(info_box, f"已清理 {removed} 个文件")
+                if removed_dirs:
+                    for d in removed_dirs:
+                        log_add(info_box, f"已删除目录：{d}")
                 aurora_showwarning("复制失败", f"发生错误：{error}", parent=root)
             else:
-                pb_main["value"] = 100
+                pb_main.set_value(100)
+                if progress_var is not None:
+                    progress_var.set("进度：100%")
                 status_lbl.config(text="复制完成")
                 log_add(info_box, f"复制完成 共 {len(created)} 个目标文件")
                 if manifest_path:
                     log_add(info_box, f"清单已保存：{manifest_path}")
                 beep_done()
-                show_finish_and_undo(root, target_dir, created)
+                show_finish_and_undo(root, target_dir, created, today)
 
         root.after(0, finalize)
 
@@ -1587,19 +1759,38 @@ def main_ui():
     combo_cat.grid(row=3, column=1, sticky="w", pady=(14, 0))
     combo_cat.current(0)
 
-    star_var = tk.BooleanVar(value=False)
-    chk_star = ttk.Checkbutton(card1, text="提取星标照片", variable=star_var, style="Aurora.TCheckbutton")
-    chk_star.grid(row=3, column=2, sticky="w", padx=(18, 0), pady=(14, 0))
+    star_enabled = tk.BooleanVar(value=False)
+
+    def toggle_star():
+        new_state = not star_enabled.get()
+        star_enabled.set(new_state)
+        star_btn.config(text=f"提取星标照片 {'√' if new_state else '×'}")
+        log_add(info_box, "已开启星标提取" if new_state else "已关闭星标提取")
+
+    star_btn = ttk.Button(
+        card1,
+        text="提取星标照片 ×",
+        style="AuroraSecondary.TButton",
+        command=toggle_star,
+        width=16,
+    )
+    star_btn.grid(row=3, column=2, sticky="w", padx=(18, 0), pady=(14, 0))
 
     card3 = ttk.Frame(left_col, style="AuroraCard.TFrame", padding=(28, 24))
     card3.grid(row=1, column=0, sticky="ew", pady=(20, 0))
     card3.grid_columnconfigure(0, weight=1)
     card3.grid_columnconfigure(1, weight=0)
-    card3.grid_columnconfigure(2, weight=0)
-    pb_main = ttk.Progressbar(card3, style="Aurora.Horizontal.TProgressbar", orient="horizontal", mode="determinate")
-    pb_main.grid(row=0, column=0, columnspan=3, sticky="ew")
+    card3.grid_columnconfigure(2, weight=1)
+    card3.grid_columnconfigure(3, weight=0)
+    card3.grid_columnconfigure(4, weight=0)
+    pb_main = AuroraProgressBar(card3)
+    pb_main.grid(row=0, column=0, columnspan=4, sticky="ew")
+    progress_pct_var = tk.StringVar(value="进度：0%")
+    ttk.Label(card3, textvariable=progress_pct_var, style="AuroraStatus.TLabel").grid(
+        row=0, column=4, sticky="e", padx=(16, 0)
+    )
     status_lbl = ttk.Label(card3, text="待机", style="AuroraStatus.TLabel")
-    status_lbl.grid(row=1, column=0, columnspan=3, sticky="w", pady=(12, 0))
+    status_lbl.grid(row=1, column=0, columnspan=5, sticky="w", pady=(12, 0))
 
     def on_pause():
         if not state.is_copying:
@@ -1631,6 +1822,39 @@ def main_ui():
         status_lbl.config(text="取消中…")
         log_add(info_box, "取消中…")
 
+    def open_current_month():
+        cfg_local = load_config()
+        dst_value = combo_dst.get().strip()
+        if dst_value:
+            base = dst_value.split(" ", 1)[0].strip()
+            if os.name == "nt" and base and not base.endswith("\\"):
+                target_root = base + "\\"
+            else:
+                target_root = base
+        else:
+            target_root = cfg_local.get("last_target_root", "")
+        if not target_root:
+            aurora_showwarning("提示", "请先选择目标硬盘或配置目标目录。", parent=root)
+            return
+        today = datetime.now()
+        category = combo_cat.get().strip() or CATEGORIES[0]
+        primary = os.path.join(target_root, str(today.year), category, f"{today.month:02d}月")
+        alt = os.path.join(target_root, f"{today.year}年{today.month:02d}月")
+        chosen = None
+        for candidate in (primary, alt):
+            if os.path.isdir(candidate):
+                chosen = candidate
+                break
+        if chosen is None:
+            chosen = primary
+            try:
+                os.makedirs(chosen, exist_ok=True)
+            except Exception as exc:
+                aurora_showwarning("打开失败", f"无法创建目录：{exc}", parent=root)
+                return
+        log_add(info_box, f"打开目录：{chosen}")
+        _open_folder(chosen)
+
     def start_action():
         if state.is_copying:
             return
@@ -1652,18 +1876,23 @@ def main_ui():
             status_lbl,
             pause_btn,
             cancel_btn,
+            star_btn,
             state,
-            extract_star=star_var.get(),
+            progress_pct_var,
+            extract_star=star_enabled.get(),
         )
 
     btn_start = ttk.Button(card3, text="开始分类", style="AuroraPrimary.TButton", command=start_action)
     btn_start.grid(row=2, column=0, sticky="w", pady=(18, 0))
 
+    open_btn = ttk.Button(card3, text="打开文件夹", style="AuroraSecondary.TButton", command=open_current_month)
+    open_btn.grid(row=2, column=1, sticky="w", padx=(16, 0), pady=(18, 0))
+
     pause_btn = ttk.Button(card3, text="暂停", style="AuroraSecondary.TButton", command=on_pause, state="disabled")
-    pause_btn.grid(row=2, column=1, sticky="e", padx=(18, 0), pady=(18, 0))
+    pause_btn.grid(row=2, column=3, sticky="e", padx=(0, 0), pady=(18, 0))
 
     cancel_btn = ttk.Button(card3, text="取消", style="Danger.TButton", command=on_cancel, state="disabled")
-    cancel_btn.grid(row=2, column=2, sticky="e", padx=(16, 0), pady=(18, 0))
+    cancel_btn.grid(row=2, column=4, sticky="e", padx=(16, 0), pady=(18, 0))
 
     footer = ttk.Label(root, text="此软件完全免费，请勿倒卖！ by: 抖音@摄影师陈同学", style="AuroraFooter.TLabel", anchor="center")
     footer.grid(row=2, column=0, columnspan=2, pady=(0, 18))
