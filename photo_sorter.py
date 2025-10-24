@@ -1,4 +1,4 @@
-# 陈同学影像管理助手 v1.7.3
+# 陈同学影像管理助手 v1.7.4
 # 更新点：
 # - 开始/完成提示音
 # - 复制过程无弹窗；主界面显示进度与速度（MB/s）
@@ -6,7 +6,7 @@
 # - 保留星标提取、撤销、主题切换、可拖动分割、稳定日志、容量显示修复、版权提示
 # - 弹窗统一 Aurora 风格并适配暗黑主题
 # - 新增 Aurora 风格文本输入弹窗，统一拍摄名称输入体验
-# - 进度条升级为圆角凹槽并新增百分比显示，支持快速打开当月目录与星标按钮状态提示
+# - 进度条升级为圆角凹槽并新增百分比显示，支持快速打开当月目录、星标按钮联动复选框与统一按钮样式
 
 import os, sys, json, time, shutil, platform, subprocess, re, threading
 import tkinter as tk
@@ -15,7 +15,7 @@ from datetime import datetime
 
 from types import SimpleNamespace
 
-VERSION = "v1.7.3"
+VERSION = "v1.7.4"
 CONFIG_FILE = "photo_sorter_config.json"
 CATEGORIES = ["婚礼", "写真", "日常记录", "旅游记录", "商业活动拍摄"]
 THEMES = ["暗黑"]
@@ -296,20 +296,57 @@ def rollback_files(paths, target_root):
         except Exception:
             pass
     prune_candidates = set()
+    # 预置常规子目录，确保即使尚未复制文件也能清理空目录
+    standard_subdirs = [
+        os.path.join(root_abs, "RAW"),
+        os.path.join(root_abs, "JPG"),
+        os.path.join(root_abs, "VIDEO"),
+        os.path.join(root_abs, "已星标照片"),
+        os.path.join(root_abs, "已星标照片", "已星标JPG"),
+        os.path.join(root_abs, "已星标照片", "已星标RAW"),
+    ]
+    prune_candidates.update(os.path.abspath(d) for d in standard_subdirs)
+    prune_candidates.add(root_abs)
+
     for path in paths:
-        parent = os.path.dirname(path)
+        parent = os.path.dirname(os.path.abspath(path))
         while parent and parent.startswith(root_abs):
             prune_candidates.add(parent)
             next_parent = os.path.dirname(parent)
             if next_parent == parent:
                 break
             parent = next_parent
-    for folder in sorted(prune_candidates, key=len, reverse=True):
+
+    def _safe_rmdir(folder):
         try:
             if os.path.isdir(folder) and not os.listdir(folder):
                 os.rmdir(folder)
+                return True
         except Exception:
             pass
+        return False
+
+    for folder in sorted(prune_candidates, key=len, reverse=True):
+        _safe_rmdir(folder)
+
+    # 继续向上清理“月/类别/年份”空目录，但不越过导入根目录
+    try:
+        stop_at = os.path.abspath(os.path.join(root_abs, os.pardir, os.pardir, os.pardir, os.pardir))
+    except Exception:
+        stop_at = None
+
+    parent = os.path.dirname(root_abs)
+    while parent:
+        if stop_at is not None:
+            try:
+                if os.path.commonpath([stop_at, parent]) != stop_at or parent == stop_at:
+                    break
+            except Exception:
+                break
+        if not _safe_rmdir(parent):
+            break
+        parent = os.path.dirname(parent)
+
     return removed
 
 
@@ -1253,6 +1290,7 @@ def start_copy(
     pause_btn,
     cancel_btn,
     star_btn,
+    star_check,
     state,
     progress_var=None,
     extract_star=False,
@@ -1367,6 +1405,7 @@ def start_copy(
     pause_btn.config(state="disabled", text="暂停")
     cancel_btn.config(state="disabled")
     star_btn.config(state="disabled")
+    star_check.config(state="disabled")
 
     state.is_copying = True
     state.is_paused = False
@@ -1385,7 +1424,7 @@ def start_copy(
             pct = max(0.0, min(100.0, pct))
             pb_main.set_value(pct)
             if progress_var is not None:
-                progress_var.set(f"进度：{pct:.0f}%")
+                progress_var.set(f"进度：{int(round(pct))}%")
             status_lbl.config(
                 text=f"{phase} | {bytes_to_human(done_bytes)} / {bytes_to_human(total)} | 速度 {speed_mb:.2f} MB/s"
             )
@@ -1457,6 +1496,7 @@ def start_copy(
             pause_btn.config(state="disabled", text="暂停")
             cancel_btn.config(state="disabled")
             star_btn.config(state="normal")
+            star_check.config(state="normal")
 
             if cancelled:
                 pb_main.reset()
@@ -1740,6 +1780,8 @@ def main_ui():
     card1 = ttk.Frame(left_col, style="AuroraCard.TFrame", padding=(28, 26))
     card1.grid(row=0, column=0, sticky="ew")
     card1.grid_columnconfigure(1, weight=1)
+    card1.grid_columnconfigure(2, weight=0)
+    card1.grid_columnconfigure(3, weight=0)
     ttk.Label(card1, text="导入设置", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 16), columnspan=5)
 
     ttk.Label(card1, text="选择素材盘", style="AuroraBody.TLabel").grid(row=1, column=0, sticky="e", padx=(0, 12))
@@ -1759,22 +1801,46 @@ def main_ui():
     combo_cat.grid(row=3, column=1, sticky="w", pady=(14, 0))
     combo_cat.current(0)
 
-    star_enabled = tk.BooleanVar(value=False)
+    star_guard_var = tk.BooleanVar(value=False)
+    star_ready_var = tk.BooleanVar(value=False)
+
+    def _sync_star_button():
+        star_btn.config(text=f"提取星标照片 {'√' if star_ready_var.get() else '×'}")
+
+    def on_star_check():
+        if star_guard_var.get():
+            log_add(info_box, "已勾选提取星标复选框")
+        else:
+            if star_ready_var.get():
+                star_ready_var.set(False)
+                _sync_star_button()
+            log_add(info_box, "已取消提取星标复选框，星标提取将停用")
 
     def toggle_star():
-        new_state = not star_enabled.get()
-        star_enabled.set(new_state)
-        star_btn.config(text=f"提取星标照片 {'√' if new_state else '×'}")
+        if not star_guard_var.get():
+            log_add(info_box, "请先勾选“提取星标”复选框，再点击按钮。")
+            return
+        new_state = not star_ready_var.get()
+        star_ready_var.set(new_state)
+        _sync_star_button()
         log_add(info_box, "已开启星标提取" if new_state else "已关闭星标提取")
 
     star_btn = ttk.Button(
         card1,
         text="提取星标照片 ×",
-        style="AuroraSecondary.TButton",
+        style="AuroraPrimary.TButton",
         command=toggle_star,
-        width=16,
     )
     star_btn.grid(row=3, column=2, sticky="w", padx=(18, 0), pady=(14, 0))
+
+    star_check = ttk.Checkbutton(
+        card1,
+        text="启用",
+        style="Aurora.TCheckbutton",
+        variable=star_guard_var,
+        command=on_star_check,
+    )
+    star_check.grid(row=3, column=3, sticky="w", padx=(12, 0), pady=(14, 0))
 
     card3 = ttk.Frame(left_col, style="AuroraCard.TFrame", padding=(28, 24))
     card3.grid(row=1, column=0, sticky="ew", pady=(20, 0))
@@ -1805,6 +1871,7 @@ def main_ui():
             state.pause_ev.clear()
             state.is_paused = False
             pause_btn.config(text="暂停")
+            status_lbl.config(text="继续执行")
             log_add(info_box, "继续执行")
 
     def on_cancel():
@@ -1864,6 +1931,7 @@ def main_ui():
             return
         src_drive = sv.split("|", 1)[0].strip()
         dst_letter = combo_dst.get().split(" ", 1)[0].strip().rstrip("\\") if combo_dst.get() else ""
+        extract_star_flag = star_guard_var.get() and star_ready_var.get()
         start_copy(
             src_drive,
             dst_letter,
@@ -1877,21 +1945,22 @@ def main_ui():
             pause_btn,
             cancel_btn,
             star_btn,
+            star_check,
             state,
             progress_pct_var,
-            extract_star=star_enabled.get(),
+            extract_star=extract_star_flag,
         )
 
     btn_start = ttk.Button(card3, text="开始分类", style="AuroraPrimary.TButton", command=start_action)
     btn_start.grid(row=2, column=0, sticky="w", pady=(18, 0))
 
-    open_btn = ttk.Button(card3, text="打开文件夹", style="AuroraSecondary.TButton", command=open_current_month)
+    open_btn = ttk.Button(card3, text="打开文件夹", style="AuroraPrimary.TButton", command=open_current_month)
     open_btn.grid(row=2, column=1, sticky="w", padx=(16, 0), pady=(18, 0))
 
-    pause_btn = ttk.Button(card3, text="暂停", style="AuroraSecondary.TButton", command=on_pause, state="disabled")
+    pause_btn = ttk.Button(card3, text="暂停", style="AuroraPrimary.TButton", command=on_pause, state="disabled")
     pause_btn.grid(row=2, column=3, sticky="e", padx=(0, 0), pady=(18, 0))
 
-    cancel_btn = ttk.Button(card3, text="取消", style="Danger.TButton", command=on_cancel, state="disabled")
+    cancel_btn = ttk.Button(card3, text="取消", style="AuroraPrimary.TButton", command=on_cancel, state="disabled")
     cancel_btn.grid(row=2, column=4, sticky="e", padx=(16, 0), pady=(18, 0))
 
     footer = ttk.Label(root, text="此软件完全免费，请勿倒卖！ by: 抖音@摄影师陈同学", style="AuroraFooter.TLabel", anchor="center")
