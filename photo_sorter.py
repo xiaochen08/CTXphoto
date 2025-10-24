@@ -1,9 +1,11 @@
-# 陈同学影像管理助手 v1.7.0
+# 陈同学影像管理助手 v1.7.2
 # 更新点：
 # - 开始/完成提示音
 # - 复制过程无弹窗；主界面显示进度与速度（MB/s）
 # - 进度条按字节比例；速度=累计字节/耗时
 # - 保留星标提取、撤销、主题切换、可拖动分割、稳定日志、容量显示修复、版权提示
+# - 弹窗统一 Aurora 风格并适配暗黑主题
+# - 新增 Aurora 风格文本输入弹窗，统一拍摄名称输入体验
 
 import os, sys, json, time, shutil, platform, subprocess, re
 import tkinter as tk
@@ -12,10 +14,11 @@ from datetime import datetime
 
 from types import SimpleNamespace
 
-VERSION = "v1.7.0"
+VERSION = "v1.7.2"
 CONFIG_FILE = "photo_sorter_config.json"
 CATEGORIES = ["婚礼", "写真", "日常记录", "旅游记录", "商业活动拍摄"]
-THEMES = ["日间", "暗黑"]
+THEMES = ["暗黑"]
+DEFAULT_THEME_KEY = "dark"
 
 SUPPRESS_RUNTIME_WARNINGS = any(arg in ("-h", "--help") for arg in sys.argv[1:])
 
@@ -162,10 +165,14 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE,"r",encoding="utf-8") as f:
             cfg = json.load(f)
-            if "theme" not in cfg: cfg["theme"] = "light"
+            theme = cfg.get("theme", DEFAULT_THEME_KEY)
+            if theme not in {DEFAULT_THEME_KEY}:
+                cfg["theme"] = DEFAULT_THEME_KEY
+            if "theme" not in cfg:
+                cfg["theme"] = DEFAULT_THEME_KEY
             if "sash_ratio" not in cfg: cfg["sash_ratio"] = 0.55
             return cfg
-    return {"last_target_root": "", "theme": "light", "sash_ratio": 0.55}
+    return {"last_target_root": "", "theme": DEFAULT_THEME_KEY, "sash_ratio": 0.55}
 
 def save_config(cfg):
     with open(CONFIG_FILE,"w",encoding="utf-8") as f: json.dump(cfg,f,ensure_ascii=False,indent=2)
@@ -322,14 +329,27 @@ def show_finish_and_undo(root, target_dir, created_files):
 
     # 统一应用当前主题（修复暗黑/日间不匹配）
     try:
-        theme_key = load_config().get("theme", "light")
+        theme_key = load_config().get("theme", DEFAULT_THEME_KEY)
     except Exception:
-        theme_key = "light"
+        theme_key = DEFAULT_THEME_KEY
+    if theme_key not in {DEFAULT_THEME_KEY}:
+        theme_key = DEFAULT_THEME_KEY
     apply_theme(win, theme_key)
 
-    pad = {"padx": 16, "pady": 8}
-    ttk.Label(win, text="导入完成", style="WeChatTitle.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", **pad)
-    ttk.Label(win, text=f"输出目录：  {target_dir}", style="WeChatBody.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", **pad)
+    win.grid_rowconfigure(0, weight=1)
+    win.grid_columnconfigure(0, weight=1)
+
+    container = ttk.Frame(win, style="AuroraCard.TFrame", padding=(26, 22))
+    container.grid(row=0, column=0, sticky="nsew")
+    for i in range(3):
+        container.grid_columnconfigure(i, weight=1 if i == 0 else 0)
+
+    accent = ttk.Frame(container, style="AuroraAccent.TFrame", height=3)
+    accent.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 18))
+    accent.grid_propagate(False)
+
+    ttk.Label(container, text="导入完成", style="AuroraSection.TLabel").grid(row=1, column=0, columnspan=3, sticky="w")
+    ttk.Label(container, text=f"输出目录：  {target_dir}", style="AuroraBody.TLabel").grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
     def _open():
         try:
@@ -355,15 +375,15 @@ def show_finish_and_undo(root, target_dir, created_files):
         try:
             if os.path.isdir(target_dir) and not os.listdir(target_dir): os.rmdir(target_dir)
         except Exception: pass
-        messagebox.showinfo("撤销完成", f"已删除本次导入生成的 {removed} 个文件。")
+        aurora_showinfo("撤销完成", f"已删除本次导入生成的 {removed} 个文件。", parent=win)
         win.destroy()
 
-    ttk.Button(win, text="打开输出文件夹", style="WeChatPrimary.TButton", command=_open)\
-        .grid(row=2, column=0, sticky="w", padx=16, pady=(10,16))
-    ttk.Button(win, text="撤销本次导入", style="WeChatSecondary.TButton", command=undo)\
-        .grid(row=2, column=1, sticky="w", padx=8,  pady=(10,16))
-    ttk.Button(win, text="关闭", style="WeChatSecondary.TButton", command=win.destroy)\
-        .grid(row=2, column=2, sticky="e", padx=16, pady=(10,16))
+    ttk.Button(container, text="打开输出文件夹", style="AuroraPrimary.TButton", command=_open)\
+        .grid(row=3, column=0, sticky="w", pady=(22, 0))
+    ttk.Button(container, text="撤销本次导入", style="AuroraSecondary.TButton", command=undo)\
+        .grid(row=3, column=1, sticky="w", padx=(16, 0), pady=(22, 0))
+    ttk.Button(container, text="关闭", style="AuroraGhost.TButton", command=win.destroy)\
+        .grid(row=3, column=2, sticky="e", padx=(16, 0), pady=(22, 0))
 
     # 计算尺寸后居中到父窗口
     win.update_idletasks()
@@ -488,38 +508,403 @@ def _update(pb,lab,copied,total,start,phase):
     lab.config(text=f"{phase} {copied}/{total} | 速度 {sp:.2f}/秒 | 预计剩余 {eta} 秒"); lab.update()
 
 # ---------- 主题 ----------
-THEME_PALETTES = {
-    "light": {"BG":"#F7F7F7","CARD":"#FFFFFF","TEXT":"#111111","SUB":"#6B6B6B","BORDER":"#E6E6E6","GREEN":"#07C160","GREEN_DARK":"#05924C","INPUT_BG":"#FFFFFF","INPUT_FG":"#111111"},
-    "dark":  {"BG":"#141414","CARD":"#1F1F1F","TEXT":"#EDEDED","SUB":"#A3A3A3","BORDER":"#2A2A2A","GREEN":"#07C160","GREEN_DARK":"#05924C","INPUT_BG":"#1F1F1F","INPUT_FG":"#EDEDED"}
+AURORA_THEME = {
+    "BG": "#050A16",
+    "HEADER_BG": "#0E1626",
+    "PANEL_BG": "#0B1322",
+    "CARD": "#111E32",
+    "CARD_HIGHLIGHT": "#17263C",
+    "CARD_BORDER": "#1F2E45",
+    "TEXT": "#F4F7FB",
+    "SUB": "#8EA3C0",
+    "STATUS": "#94A3B8",
+    "ACCENT": "#38BDF8",
+    "ACCENT_HOVER": "#0EA5E9",
+    "ACCENT_ACTIVE": "#0284C7",
+    "ACCENT_LINE": "#60A5FA",
+    "INPUT_BG": "#15243A",
+    "INPUT_FG": "#E2E8F0",
+    "INPUT_BORDER": "#1F3450",
+    "TROUGH": "#102036",
+    "SCROLLBAR_BG": "#0D182B",
+    "SCROLLBAR_FG": "#1D3554"
 }
+
+
+def _font(size, weight="normal"):
+    if weight == "bold":
+        return ("Microsoft YaHei UI", size, "bold")
+    return ("Microsoft YaHei UI", size)
+
 
 def apply_theme(root, theme_key, info_text_widget=None):
     style = ttk.Style()
-    try: style.theme_use("clam")
-    except Exception: pass
-    P = THEME_PALETTES["dark" if theme_key=="dark" else "light"]
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+
+    P = AURORA_THEME
 
     root.configure(bg=P["BG"])
-    style.configure("WeChatTitle.TLabel", background=P["BG"], foreground=P["TEXT"], font=("SimHei",18))
-    style.configure("WeChatH2.TLabel",    background=P["BG"], foreground=P["TEXT"], font=("SimHei",14))
-    style.configure("WeChatBody.TLabel",  background=P["BG"], foreground=P["TEXT"], font=("SimHei",12))
-    style.configure("WeChatSubtle.TLabel",background=P["BG"], foreground=P["SUB"],  font=("SimHei",11))
-    style.configure("WeChatFrame.TFrame", background=P["BG"])
-    style.configure("WeChatCard.TFrame",  background=P["CARD"], relief="flat")
-    style.configure("WeChatPrimary.TButton", background=P["GREEN"], foreground="#FFFFFF", font=("SimHei",12), padding=6, borderwidth=0)
-    style.map("WeChatPrimary.TButton", background=[("active", P["GREEN_DARK"])])
-    style.configure("WeChatSecondary.TButton", background="#2b2b2b" if theme_key=="dark" else "#EDEDED", foreground=P["TEXT"], font=("SimHei",12), padding=6, borderwidth=0)
-    style.map("WeChatSecondary.TButton", background=[("active", "#3a3a3a" if theme_key=="dark" else "#E0E0E0")])
-    style.configure("WeChat.Horizontal.TProgressbar", troughcolor=P["BORDER"], background=P["GREEN"], bordercolor=P["BORDER"], lightcolor=P["GREEN"], darkcolor=P["GREEN"])
-    style.configure("TCombobox", fieldbackground=P["INPUT_BG"], background=P["INPUT_BG"], foreground=P["TEXT"], bordercolor=P["BORDER"], arrowcolor=P["TEXT"])
-    style.map("TCombobox", fieldbackground=[("readonly", P["INPUT_BG"])], foreground=[("readonly", P["TEXT"])], background=[("readonly", P["INPUT_BG"])])
+    try:
+        root.option_add("*TCombobox*Listbox.background", P["CARD"])
+        root.option_add("*TCombobox*Listbox.foreground", P["TEXT"])
+        root.option_add("*TCombobox*Listbox.selectBackground", P["ACCENT"])
+        root.option_add("*TCombobox*Listbox.selectForeground", "#061427")
+    except Exception:
+        pass
+
+    style.configure("TPanedwindow", background=P["PANEL_BG"], bordercolor=P["PANEL_BG"], relief="flat")
+    style.configure("TPanedwindow.Pane", background=P["PANEL_BG"])
+
+    style.configure("AuroraHeader.TFrame", background=P["HEADER_BG"], borderwidth=0, relief="flat")
+    style.configure("AuroraPanel.TFrame", background=P["PANEL_BG"], borderwidth=0, relief="flat")
+    style.configure("AuroraCard.TFrame", background=P["CARD"], borderwidth=1, relief="flat", bordercolor=P["CARD_BORDER"])
+    style.configure("AuroraAccent.TFrame", background=P["ACCENT_LINE"])
+
+    style.configure("AuroraTitle.TLabel", background=P["HEADER_BG"], foreground=P["TEXT"], font=_font(20, "bold"))
+    style.configure("AuroraSection.TLabel", background=P["CARD"], foreground=P["TEXT"], font=_font(15, "bold"))
+    style.configure("AuroraBody.TLabel", background=P["CARD"], foreground=P["TEXT"], font=_font(12))
+    style.configure("AuroraBodyOnPanel.TLabel", background=P["HEADER_BG"], foreground=P["TEXT"], font=_font(12))
+    style.configure("AuroraSubtle.TLabel", background=P["CARD"], foreground=P["SUB"], font=_font(11))
+    style.configure("AuroraStatus.TLabel", background=P["CARD"], foreground=P["STATUS"], font=_font(11))
+    style.configure("AuroraFooter.TLabel", background=P["BG"], foreground=P["SUB"], font=_font(10))
+
+    style.configure("AuroraPrimary.TButton", background=P["ACCENT"], foreground="#051225", font=_font(12, "bold"), padding=(22, 10), borderwidth=0, focusthickness=0, focuscolor=P["ACCENT_ACTIVE"])
+    style.map(
+        "AuroraPrimary.TButton",
+        background=[("pressed", P["ACCENT_ACTIVE"]), ("active", P["ACCENT_HOVER"])],
+        foreground=[("pressed", "#E6F6FF"), ("active", "#F0F9FF")],
+    )
+
+    style.configure("AuroraSecondary.TButton", background=P["CARD_HIGHLIGHT"], foreground=P["TEXT"], font=_font(12), padding=(18, 10), borderwidth=0, focusthickness=0)
+    style.map(
+        "AuroraSecondary.TButton",
+        background=[("pressed", P["ACCENT_ACTIVE"]), ("active", P["CARD_BORDER"])],
+        foreground=[("pressed", "#F8FAFC")],
+    )
+
+    style.configure("AuroraGhost.TButton", background=P["HEADER_BG"], foreground=P["TEXT"], font=_font(11), padding=(16, 8), borderwidth=0, focusthickness=0)
+    style.map(
+        "AuroraGhost.TButton",
+        background=[("active", P["CARD_BORDER"]), ("pressed", P["ACCENT_ACTIVE"])],
+        foreground=[("pressed", "#F8FAFC")],
+    )
+
+    style.configure("Aurora.Horizontal.TProgressbar", troughcolor=P["TROUGH"], bordercolor=P["TROUGH"], background=P["ACCENT"], darkcolor=P["ACCENT_ACTIVE"], lightcolor=P["ACCENT"], thickness=10)
+
+    style.configure("Aurora.TCombobox", fieldbackground=P["INPUT_BG"], background=P["INPUT_BG"], foreground=P["INPUT_FG"], bordercolor=P["INPUT_BORDER"], arrowcolor=P["SUB"])
+    style.map(
+        "Aurora.TCombobox",
+        fieldbackground=[("readonly", P["INPUT_BG"]), ("active", P["INPUT_BG"])],
+        foreground=[("readonly", P["INPUT_FG"])],
+        background=[("readonly", P["INPUT_BG"])],
+        arrowcolor=[("active", P["ACCENT"]), ("readonly", P["SUB"])],
+    )
+
+    style.configure("Aurora.TEntry", fieldbackground=P["INPUT_BG"], foreground=P["INPUT_FG"], bordercolor=P["INPUT_BORDER"], padding=(12, 8))
+    style.map(
+        "Aurora.TEntry",
+        fieldbackground=[("focus", P["INPUT_BG"])],
+        bordercolor=[("focus", P["ACCENT_LINE"])],
+        foreground=[("disabled", P["SUB"])],
+    )
+
+    style.configure("Aurora.TCheckbutton", background=P["CARD"], foreground=P["TEXT"], font=_font(11))
+    style.map("Aurora.TCheckbutton", background=[("active", P["CARD_HIGHLIGHT"])], foreground=[("disabled", P["SUB"])])
+
+    style.configure("Aurora.Vertical.TScrollbar", background=P["CARD"], troughcolor=P["SCROLLBAR_BG"], bordercolor=P["CARD"], darkcolor=P["CARD"], lightcolor=P["CARD"], arrowsize=12)
+    style.map(
+        "Aurora.Vertical.TScrollbar",
+        background=[("active", P["CARD_HIGHLIGHT"]), ("pressed", P["ACCENT_ACTIVE"])],
+        arrowcolor=[("active", P["ACCENT"])],
+    )
 
     if info_text_widget is not None:
-        info_text_widget.configure(bg=P["CARD"], fg=P["TEXT"], insertbackground=P["TEXT"])
+        info_text_widget.configure(
+            bg=AURORA_THEME["CARD_HIGHLIGHT"],
+            fg=AURORA_THEME["TEXT"],
+            insertbackground=AURORA_THEME["ACCENT"],
+            highlightthickness=0,
+            relief="flat",
+            selectbackground=AURORA_THEME["ACCENT"],
+            selectforeground="#071425",
+        )
+
 
 def set_text_theme(widget, theme_key):
-    P = THEME_PALETTES["dark" if theme_key=="dark" else "light"]
-    widget.configure(bg=P["CARD"], fg=P["TEXT"], insertbackground=P["TEXT"])
+    widget.configure(
+        bg=AURORA_THEME["CARD_HIGHLIGHT"],
+        fg=AURORA_THEME["TEXT"],
+        insertbackground=AURORA_THEME["ACCENT"],
+        selectbackground=AURORA_THEME["ACCENT"],
+        selectforeground="#071425",
+        highlightthickness=0,
+        relief="flat",
+        padx=16,
+        pady=14,
+    )
+
+
+def _normalize_parent(widget):
+    if widget is None:
+        widget = tk._default_root
+    if widget is None:
+        return None
+    try:
+        return widget.winfo_toplevel()
+    except Exception:
+        return None
+
+
+def _can_use_modal(widget):
+    if widget is None:
+        return False
+    try:
+        return bool(widget.winfo_exists())
+    except Exception:
+        return False
+
+
+def _aurora_modal(title, message, *, level="info", buttons, parent=None, default_index=0, close_value=None, width=460):
+    toplevel = _normalize_parent(parent)
+    if not _can_use_modal(toplevel):
+        return None
+
+    win = tk.Toplevel(toplevel)
+    win.withdraw()
+    win.title(title)
+    win.resizable(False, False)
+    win.transient(toplevel)
+    win.grab_set()
+    win.attributes("-topmost", True)
+
+    apply_theme(win, DEFAULT_THEME_KEY)
+    win.configure(bg=AURORA_THEME["HEADER_BG"])
+
+    palette = {
+        "info": AURORA_THEME["ACCENT_LINE"],
+        "warning": "#F97316",
+        "danger": "#F87171",
+    }
+    accent_color = palette.get(level, AURORA_THEME["ACCENT_LINE"])
+
+    accent = tk.Frame(win, bg=accent_color, height=4, bd=0, highlightthickness=0)
+    accent.pack(fill="x")
+
+    container = ttk.Frame(win, style="AuroraCard.TFrame", padding=(28, 24))
+    container.pack(fill="both", expand=True)
+
+    title_label = ttk.Label(container, text=title, style="AuroraSection.TLabel")
+    title_label.pack(anchor="w")
+
+    body_label = ttk.Label(
+        container,
+        text=message,
+        style="AuroraBody.TLabel",
+        wraplength=width,
+        justify="left",
+    )
+    body_label.pack(anchor="w", pady=(12, 0))
+
+    btn_frame = ttk.Frame(container, style="AuroraCard.TFrame")
+    btn_frame.pack(anchor="e", pady=(26, 6))
+
+    result = {"value": close_value}
+
+    def close_with(value):
+        result["value"] = value
+        win.destroy()
+
+    def on_close():
+        result["value"] = close_value
+        win.destroy()
+
+    win.protocol("WM_DELETE_WINDOW", on_close)
+
+    default_btn = None
+    for idx, (text, style_name, value) in enumerate(buttons):
+        btn = ttk.Button(btn_frame, text=text, style=style_name, command=lambda v=value: close_with(v))
+        if idx < len(buttons) - 1:
+            btn.pack(side="right", padx=(12, 0))
+        else:
+            btn.pack(side="right")
+        if idx == default_index:
+            default_btn = btn
+
+    if default_btn is not None:
+        default_btn.focus_set()
+        win.bind("<Return>", lambda _event: close_with(buttons[default_index][2]))
+    win.bind("<Escape>", lambda _event: on_close())
+
+    win.update_idletasks()
+    if toplevel is not None:
+        toplevel.update_idletasks()
+        pw, ph = toplevel.winfo_width(), toplevel.winfo_height()
+        px, py = toplevel.winfo_rootx(), toplevel.winfo_rooty()
+        cw, ch = win.winfo_width(), win.winfo_height()
+        x = px + max((pw - cw) // 2, 0)
+        y = py + max((ph - ch) // 2, 0)
+        win.geometry(f"+{x}+{y}")
+
+    win.deiconify()
+    win.wait_window()
+    return result["value"]
+
+
+def aurora_askstring(title, prompt, *, parent=None, initialvalue=""):
+    toplevel = _normalize_parent(parent)
+    if not _can_use_modal(toplevel):
+        return simpledialog.askstring(title, prompt, parent=parent, initialvalue=initialvalue)
+
+    win = tk.Toplevel(toplevel)
+    win.withdraw()
+    win.title(title)
+    win.resizable(False, False)
+    win.transient(toplevel)
+    win.grab_set()
+    win.attributes("-topmost", True)
+
+    apply_theme(win, DEFAULT_THEME_KEY)
+    win.configure(bg=AURORA_THEME["HEADER_BG"])
+
+    accent = tk.Frame(win, bg=AURORA_THEME["ACCENT_LINE"], height=4, bd=0, highlightthickness=0)
+    accent.pack(fill="x")
+
+    container = ttk.Frame(win, style="AuroraCard.TFrame", padding=(28, 24))
+    container.pack(fill="both", expand=True)
+
+    title_label = ttk.Label(container, text=title, style="AuroraSection.TLabel")
+    title_label.pack(anchor="w")
+
+    body_label = ttk.Label(container, text=prompt, style="AuroraBody.TLabel", wraplength=440, justify="left")
+    body_label.pack(anchor="w", pady=(12, 0))
+
+    entry = tk.Entry(container, font=_font(12))
+    entry.insert(0, initialvalue or "")
+    entry.configure(
+        bg=AURORA_THEME["INPUT_BG"],
+        fg=AURORA_THEME["INPUT_FG"],
+        insertbackground=AURORA_THEME["ACCENT"],
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground=AURORA_THEME["INPUT_BORDER"],
+        highlightcolor=AURORA_THEME["ACCENT_LINE"],
+        selectbackground=AURORA_THEME["ACCENT"],
+        selectforeground="#071425",
+        insertwidth=2,
+    )
+    entry.pack(fill="x", pady=(18, 0))
+
+    result = {"value": None}
+
+    def submit():
+        result["value"] = entry.get()
+        win.destroy()
+
+    def cancel():
+        result["value"] = None
+        win.destroy()
+
+    btn_frame = ttk.Frame(container, style="AuroraCard.TFrame")
+    btn_frame.pack(anchor="e", pady=(24, 6))
+
+    btn_cancel = ttk.Button(btn_frame, text="取消", style="AuroraGhost.TButton", command=cancel)
+    btn_cancel.pack(side="right", padx=(12, 0))
+
+    btn_ok = ttk.Button(btn_frame, text="确认", style="AuroraPrimary.TButton", command=submit)
+    btn_ok.pack(side="right")
+
+    win.protocol("WM_DELETE_WINDOW", cancel)
+    win.bind("<Escape>", lambda _event: cancel())
+    win.bind("<Return>", lambda _event: submit())
+
+    win.update_idletasks()
+    if toplevel is not None:
+        toplevel.update_idletasks()
+        pw, ph = toplevel.winfo_width(), toplevel.winfo_height()
+        px, py = toplevel.winfo_rootx(), toplevel.winfo_rooty()
+        cw, ch = win.winfo_width(), win.winfo_height()
+        x = px + max((pw - cw) // 2, 0)
+        y = py + max((ph - ch) // 2, 0)
+        win.geometry(f"+{x}+{y}")
+
+    win.deiconify()
+    entry.focus_set()
+    entry.select_range(0, tk.END)
+    win.wait_window()
+    return result["value"]
+
+
+def aurora_showinfo(title, message, parent=None):
+    toplevel = _normalize_parent(parent)
+    if not _can_use_modal(toplevel):
+        messagebox.showinfo(title, message, parent=parent)
+        return
+    _aurora_modal(
+        title,
+        message,
+        level="info",
+        buttons=[("确定", "AuroraPrimary.TButton", True)],
+        parent=toplevel,
+        default_index=0,
+    )
+
+
+def aurora_showwarning(title, message, parent=None):
+    toplevel = _normalize_parent(parent)
+    if not _can_use_modal(toplevel):
+        messagebox.showwarning(title, message, parent=parent)
+        return
+    _aurora_modal(
+        title,
+        message,
+        level="warning",
+        buttons=[("我知道了", "AuroraPrimary.TButton", True)],
+        parent=toplevel,
+        default_index=0,
+    )
+
+
+def aurora_askyesno(title, message, parent=None):
+    toplevel = _normalize_parent(parent)
+    if not _can_use_modal(toplevel):
+        return messagebox.askyesno(title, message, parent=parent)
+    return bool(
+        _aurora_modal(
+            title,
+            message,
+            level="info",
+            buttons=[
+                ("取消", "AuroraGhost.TButton", False),
+                ("继续", "AuroraPrimary.TButton", True),
+            ],
+            parent=toplevel,
+            default_index=1,
+            close_value=False,
+        )
+    )
+
+
+def aurora_askretrycancel(title, message, parent=None):
+    toplevel = _normalize_parent(parent)
+    if not _can_use_modal(toplevel):
+        return messagebox.askretrycancel(title, message, parent=parent)
+    return bool(
+        _aurora_modal(
+            title,
+            message,
+            level="warning",
+            buttons=[
+                ("取消", "AuroraGhost.TButton", False),
+                ("重试", "AuroraPrimary.TButton", True),
+            ],
+            parent=toplevel,
+            default_index=1,
+            close_value=False,
+        )
+    )
 
 # ---------- 列表刷新 ----------
 def refresh_sources(info_box, combo_src, auto_pick=False):
@@ -569,16 +954,16 @@ def refresh_dests(info_box, combo_dst):
 # ---------- 复制入口 ----------
 def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_main, status_lbl, extract_star=False):
     if not category:
-        messagebox.showwarning("提示","请先选择拍摄类型。"); return
+        aurora_showwarning("提示","请先选择拍摄类型。", parent=root); return
     dtype=drive_type_name(get_drive_type_code(src_drive))
     log_add(info_box,f"素材盘：{src_drive}（{get_drive_label(src_drive)} | {dtype}）")
     if is_system_drive(src_drive):
-        if not messagebox.askyesno("高风险确认",f"{src_drive} 是系统盘，不建议作为素材盘源。继续？"): return
-        if not messagebox.askyesno("二次确认","再次确认从系统盘作为相机源复制？"): return
+        if not aurora_askyesno("高风险确认",f"{src_drive} 是系统盘，不建议作为素材盘源。继续？", parent=root): return
+        if not aurora_askyesno("二次确认","再次确认从系统盘作为相机源复制？", parent=root): return
     elif get_drive_type_code(src_drive)!=2:
-        if not messagebox.askyesno("固定磁盘警告",f"{src_drive} 为固定盘，通常应选移动盘。继续？"): return
+        if not aurora_askyesno("固定磁盘警告",f"{src_drive} 为固定盘，通常应选移动盘。继续？", parent=root): return
 
-    shoot_name=simpledialog.askstring("本次拍摄名称","输入拍摄地点或主题（可中文）：",parent=root)
+    shoot_name=aurora_askstring("本次拍摄名称","输入拍摄地点或主题（可中文）：", parent=root, initialvalue="")
     if not shoot_name: return
 
     total_b,free_b=get_drive_usage_bytes(src_drive)
@@ -589,7 +974,7 @@ def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_mai
     total_size =sizes["RAW"] +sizes["JPG"] +sizes["VIDEO"]
     log_add(info_box,f"预检完成 RAW:{counts['RAW']} JPG:{counts['JPG']} VIDEO:{counts['VIDEO']} 合计:{total_files} | 体积 {bytes_to_human(total_size)}")
 
-    if not messagebox.askyesno("确认复制",
+    if not aurora_askyesno("确认复制",
         "预检完成：\n"
         f"RAW：{counts['RAW']}（{bytes_to_human(sizes['RAW'])}）\n"
         f"JPG：{counts['JPG']}（{bytes_to_human(sizes['JPG'])}）\n"
@@ -611,7 +996,7 @@ def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_mai
             if not target_root: return
     cfg["last_target_root"]=target_root; save_config(cfg)
     if os.path.splitdrive(target_root)[0].upper()==os.path.splitdrive(src_drive)[0].upper():
-        if not messagebox.askyesno("风险提示","目标盘与素材盘相同盘符，建议不同物理盘。继续？"): return
+        if not aurora_askyesno("风险提示","目标盘与素材盘相同盘符，建议不同物理盘。继续？", parent=root): return
 
     today=datetime.now()
     year_dir=os.path.join(target_root,str(today.year))
@@ -626,8 +1011,9 @@ def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_mai
         _,dst_free=get_drive_usage_bytes(usage_key)
         if dst_free<total_size:
             log_add(info_box,f"目标剩余 {bytes_to_human(dst_free)} < 需要 {bytes_to_human(total_size)}")
-            if not messagebox.askretrycancel("空间不足",
-                f"目标剩余 {bytes_to_human(dst_free)}，预计需要 {bytes_to_human(total_size)}。清理后重试。"):
+            if not aurora_askretrycancel("空间不足",
+                f"目标剩余 {bytes_to_human(dst_free)}，预计需要 {bytes_to_human(total_size)}。清理后重试。",
+                parent=root):
                 return
     except Exception: pass
 
@@ -833,7 +1219,9 @@ def run_cli(reason=None):
 # ---------- UI（分割窗可拖动） ----------
 def main_ui():
     cfg = load_config()
-    theme_key = cfg.get("theme","light")
+    theme_key = cfg.get("theme", DEFAULT_THEME_KEY)
+    if theme_key not in {DEFAULT_THEME_KEY}:
+        theme_key = DEFAULT_THEME_KEY
     sash_ratio = float(cfg.get("sash_ratio", 0.55))
 
     try:
@@ -843,99 +1231,115 @@ def main_ui():
         run_cli(reason="无法初始化图形界面")
         return
     root.title(f"陈同学影像管理助手  {VERSION}")
-    root.geometry("1000x720")
-    root.minsize(860, 600)
+    root.geometry("1120x760")
+    root.minsize(900, 620)
     root.resizable(True, True)
 
     apply_theme(root, theme_key)
 
-    # 顶部栏
-    header = ttk.Frame(root, style="WeChatFrame.TFrame")
-    header.grid(row=0, column=0, sticky="ew", padx=0, pady=(10,0))
-    ttk.Label(header, text="照片/视频导入与分类", style="WeChatTitle.TLabel").grid(row=0, column=0, sticky="w", padx=(20,10))
-
-    ttk.Label(header, text="主题", style="WeChatBody.TLabel").grid(row=0, column=1, sticky="e")
-    theme_box = ttk.Combobox(header, state="readonly", values=THEMES, width=6)
-    theme_box.grid(row=0, column=2, sticky="w", padx=(6,0))
-    theme_box.set("日间" if theme_key=="light" else "暗黑")
-
-    # 分割窗
-    paned = ttk.Panedwindow(root, orient="vertical")
-    paned.grid(row=1, column=0, sticky="nsew", padx=20, pady=(10,6))
     root.grid_rowconfigure(1, weight=1)
     root.grid_columnconfigure(0, weight=1)
 
-    top_frame = ttk.Frame(paned, style="WeChatFrame.TFrame")
-    bottom_frame = ttk.Frame(paned, style="WeChatFrame.TFrame")
+    # 顶部栏
+    header = ttk.Frame(root, style="AuroraHeader.TFrame", padding=(32, 26))
+    header.grid(row=0, column=0, sticky="ew", padx=36, pady=(28, 16))
+    header.columnconfigure(0, weight=1)
+    accent = ttk.Frame(header, style="AuroraAccent.TFrame", height=4)
+    accent.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 20))
+    accent.grid_propagate(False)
+    ttk.Label(header, text="照片/视频导入与分类", style="AuroraTitle.TLabel").grid(row=1, column=0, sticky="w")
+    ttk.Label(header, text="主题", style="AuroraBodyOnPanel.TLabel").grid(row=1, column=1, sticky="e", padx=(24, 10))
+    theme_box = ttk.Combobox(header, state="readonly", values=THEMES, width=8, style="Aurora.TCombobox")
+    theme_box.grid(row=1, column=2, sticky="e")
+    theme_box.set(THEMES[0])
+
+    # 分割窗
+    paned = ttk.Panedwindow(root, orient="vertical")
+    paned.grid(row=1, column=0, sticky="nsew", padx=36, pady=(0, 28))
+    try:
+        paned.configure(sashrelief="flat", sashwidth=6)
+    except Exception:
+        pass
+
+    top_frame = ttk.Frame(paned, style="AuroraPanel.TFrame")
+    bottom_frame = ttk.Frame(paned, style="AuroraPanel.TFrame")
     paned.add(top_frame, weight=3)
     paned.add(bottom_frame, weight=5)
 
+    top_frame.grid_columnconfigure(0, weight=1)
+    bottom_frame.grid_columnconfigure(0, weight=1)
+    bottom_frame.grid_rowconfigure(0, weight=1)
+
     # 顶部：设置
-    card1 = ttk.Frame(top_frame, style="WeChatCard.TFrame", padding=16)
+    card1 = ttk.Frame(top_frame, style="AuroraCard.TFrame", padding=(28, 26))
     card1.grid(row=0, column=0, sticky="ew")
     card1.grid_columnconfigure(1, weight=1)
-    ttk.Label(card1, text="导入设置", style="WeChatH2.TLabel").grid(row=0, column=0, sticky="w", pady=(0,6), columnspan=5)
+    ttk.Label(card1, text="导入设置", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 16), columnspan=5)
 
-    ttk.Label(card1, text="选择素材盘", style="WeChatBody.TLabel").grid(row=1, column=0, sticky="e", padx=(0,8))
-    combo_src = ttk.Combobox(card1, state="readonly", width=70); combo_src.grid(row=1, column=1, sticky="ew")
-    ttk.Button(card1, text="刷新", style="WeChatSecondary.TButton",
-               command=lambda: refresh_sources(info_box, combo_src, auto_pick=True)).grid(row=1, column=2, padx=(8,0))
+    ttk.Label(card1, text="选择素材盘", style="AuroraBody.TLabel").grid(row=1, column=0, sticky="e", padx=(0, 12))
+    combo_src = ttk.Combobox(card1, state="readonly", width=70, style="Aurora.TCombobox")
+    combo_src.grid(row=1, column=1, sticky="ew")
+    ttk.Button(card1, text="刷新", style="AuroraGhost.TButton",
+               command=lambda: refresh_sources(info_box, combo_src, auto_pick=True)).grid(row=1, column=2, padx=(14, 0))
 
-    ttk.Label(card1, text="拷入到", style="WeChatBody.TLabel").grid(row=2, column=0, sticky="e", padx=(0,8), pady=(8,0))
-    combo_dst = ttk.Combobox(card1, state="readonly", width=50); combo_dst.grid(row=2, column=1, sticky="w", pady=(8,0))
-    ttk.Button(card1, text="刷新", style="WeChatSecondary.TButton",
-               command=lambda: refresh_dests(info_box, combo_dst)).grid(row=2, column=2, padx=(8,0), pady=(8,0))
+    ttk.Label(card1, text="拷入到", style="AuroraBody.TLabel").grid(row=2, column=0, sticky="e", padx=(0, 12), pady=(14, 0))
+    combo_dst = ttk.Combobox(card1, state="readonly", width=50, style="Aurora.TCombobox")
+    combo_dst.grid(row=2, column=1, sticky="ew", pady=(14, 0))
+    ttk.Button(card1, text="刷新", style="AuroraGhost.TButton",
+               command=lambda: refresh_dests(info_box, combo_dst)).grid(row=2, column=2, padx=(14, 0), pady=(14, 0))
 
-    ttk.Label(card1, text="拍摄类型", style="WeChatBody.TLabel").grid(row=3, column=0, sticky="e", padx=(0,8), pady=(8,0))
-    combo_cat = ttk.Combobox(card1, state="readonly", values=CATEGORIES, width=20); combo_cat.grid(row=3, column=1, sticky="w", pady=(8,0))
+    ttk.Label(card1, text="拍摄类型", style="AuroraBody.TLabel").grid(row=3, column=0, sticky="e", padx=(0, 12), pady=(14, 0))
+    combo_cat = ttk.Combobox(card1, state="readonly", values=CATEGORIES, width=20, style="Aurora.TCombobox")
+    combo_cat.grid(row=3, column=1, sticky="w", pady=(14, 0))
     combo_cat.current(0)
 
     star_var = tk.BooleanVar(value=False)
-    chk_star = ttk.Checkbutton(card1, text="提取星标照片", variable=star_var)
-    chk_star.grid(row=3, column=2, sticky="w", padx=(12,0), pady=(8,0))
+    chk_star = ttk.Checkbutton(card1, text="提取星标照片", variable=star_var, style="Aurora.TCheckbutton")
+    chk_star.grid(row=3, column=2, sticky="w", padx=(18, 0), pady=(14, 0))
 
     # 顶部：操作 + 进度
-    card3 = ttk.Frame(top_frame, style="WeChatCard.TFrame", padding=16)
-    card3.grid(row=1, column=0, sticky="ew", pady=(10,0))
-    pb_main = ttk.Progressbar(card3, style="WeChat.Horizontal.TProgressbar", orient="horizontal", length=560, mode="determinate")
-    pb_main.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0,8))
-    status_lbl = ttk.Label(card3, text="待机", style="WeChatSubtle.TLabel")
-    status_lbl.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0,6))
+    card3 = ttk.Frame(top_frame, style="AuroraCard.TFrame", padding=(28, 24))
+    card3.grid(row=1, column=0, sticky="ew", pady=(20, 0))
+    card3.grid_columnconfigure(0, weight=1)
+    pb_main = ttk.Progressbar(card3, style="Aurora.Horizontal.TProgressbar", orient="horizontal", mode="determinate")
+    pb_main.grid(row=0, column=0, columnspan=2, sticky="ew")
+    status_lbl = ttk.Label(card3, text="待机", style="AuroraStatus.TLabel")
+    status_lbl.grid(row=1, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
     def start_action():
         sv = combo_src.get()
         if not sv:
-            messagebox.showwarning("提示","请先选择素材盘。"); return
+            aurora_showwarning("提示","请先选择素材盘。", parent=root); return
         src_drive = sv.split("|",1)[0].strip()
         dst_letter = combo_dst.get().split(" ",1)[0].strip().rstrip("\\") if combo_dst.get() else ""
         start_copy(src_drive, dst_letter, load_config(), root, combo_cat.get().strip(),
                    info_box, btn_start, pb_main, status_lbl, extract_star=star_var.get())
 
-    btn_start = ttk.Button(card3, text="开始分类", style="WeChatPrimary.TButton", command=start_action)
-    btn_start.grid(row=2, column=0, padx=(0,8))
-    ttk.Button(card3, text="退出", style="WeChatSecondary.TButton", command=root.destroy).grid(row=2, column=1)
+    btn_start = ttk.Button(card3, text="开始分类", style="AuroraPrimary.TButton", command=start_action)
+    btn_start.grid(row=2, column=0, sticky="w", pady=(18, 0))
+    ttk.Button(card3, text="退出", style="AuroraSecondary.TButton", command=root.destroy).grid(row=2, column=1, sticky="e", padx=(18, 0), pady=(18, 0))
 
     # 底部：日志
-    card2 = ttk.Frame(bottom_frame, style="WeChatCard.TFrame", padding=16)
+    card2 = ttk.Frame(bottom_frame, style="AuroraCard.TFrame", padding=(28, 24))
     card2.grid(row=0, column=0, sticky="nsew")
-    bottom_frame.grid_rowconfigure(0, weight=1)
-    bottom_frame.grid_columnconfigure(0, weight=1)
+    card2.grid_rowconfigure(1, weight=1)
+    card2.grid_columnconfigure(0, weight=1)
 
-    ttk.Label(card2, text="信息", style="WeChatH2.TLabel").grid(row=0, column=0, sticky="w", pady=(0,6))
+    ttk.Label(card2, text="信息", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 16))
     info_box = tk.Text(card2, height=10, wrap="word", bd=0, relief="flat", state="disabled")
     set_text_theme(info_box, theme_key)
     info_box.grid(row=1, column=0, sticky="nsew")
-    card2.grid_rowconfigure(1, weight=1)
-    card2.grid_columnconfigure(0, weight=1)
-    sb = ttk.Scrollbar(card2, command=info_box.yview); sb.grid(row=1, column=1, sticky="ns")
+    sb = ttk.Scrollbar(card2, command=info_box.yview, orient="vertical", style="Aurora.Vertical.TScrollbar")
+    sb.grid(row=1, column=1, sticky="ns", padx=(16, 0))
     info_box.configure(yscrollcommand=sb.set)
+
+    footer = ttk.Label(root, text="此软件完全免费，请勿倒卖！ by: 抖音@摄影师陈同学", style="AuroraFooter.TLabel", anchor="center")
+    footer.grid(row=2, column=0, pady=(0, 18))
 
     # 主题切换
     def on_theme_change(event=None):
-        sel = theme_box.get()
-        key = "light" if sel == "日间" else "dark"
-        cfg2 = load_config(); cfg2["theme"] = key; save_config(cfg2)
-        apply_theme(root, key, info_text_widget=info_box); set_text_theme(info_box, key)
+        cfg2 = load_config(); cfg2["theme"] = DEFAULT_THEME_KEY; save_config(cfg2)
+        apply_theme(root, DEFAULT_THEME_KEY, info_text_widget=info_box); set_text_theme(info_box, DEFAULT_THEME_KEY)
     theme_box.bind("<<ComboboxSelected>>", on_theme_change)
 
     # 初始化扫描
@@ -944,11 +1348,8 @@ def main_ui():
     # 版权
     def _copyright_popup():
         msg = ("此软件完全免费，请勿倒卖！\nby: 抖音 @摄影师陈同学\nCopyright © 2025")
-        messagebox.showinfo("版权声明", msg)
+        aurora_showinfo("版权声明", msg, parent=root)
     root.after(500, _copyright_popup)
-    footer = ttk.Label(root, text="此软件完全免费，请勿倒卖！ by: 抖音@摄影师陈同学", style="WeChatSubtle.TLabel", anchor="center")
-    footer.grid(row=2, column=0, pady=(2,8))
-
     # 分割比例恢复/保存
     def apply_sash_ratio_later():
         try:
