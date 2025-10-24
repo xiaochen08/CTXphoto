@@ -10,14 +10,37 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from datetime import datetime
 
+from types import SimpleNamespace
+
 VERSION = "v1.7.0"
 CONFIG_FILE = "photo_sorter_config.json"
 CATEGORIES = ["婚礼", "写真", "日常记录", "旅游记录", "商业活动拍摄"]
-THEMES = ["日间", "暗黑"]
+THEMES = ["暗黑"]
+DEFAULT_THEME_KEY = "dark"
 
-import psutil
-from PIL import Image, ExifTags
-import exifread
+SUPPRESS_RUNTIME_WARNINGS = any(arg in ("-h", "--help") for arg in sys.argv[1:])
+
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - best effort fallback for limited environments
+    psutil = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 psutil，部分磁盘信息功能将受限。", file=sys.stderr)
+
+try:
+    from PIL import Image, ExifTags
+except Exception:  # pragma: no cover - optional dependency fallback
+    Image = None
+    ExifTags = SimpleNamespace(TAGS={})
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 Pillow，EXIF 读取功能将受限。", file=sys.stderr)
+
+try:
+    import exifread
+except Exception:  # pragma: no cover - optional dependency fallback
+    exifread = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 exifread，将使用文件修改时间作为拍摄时间。", file=sys.stderr)
 
 try:
     import winsound
@@ -46,7 +69,68 @@ def get_drive_type_code(letter):
 
 def drive_type_name(code): return {2:"移动",3:"固定",4:"网络",5:"光驱",6:"RAM"}.get(code,"未知")
 def is_system_drive(letter): return letter.upper().startswith(os.environ.get("SystemDrive","C:").upper())
-def list_drives(): return [p.device for p in psutil.disk_partitions(all=True) if os.path.exists(p.mountpoint)]
+def _disk_partitions(all=True):
+    if psutil is not None:
+        try:
+            return psutil.disk_partitions(all=all)
+        except Exception:
+            pass
+
+    parts = []
+    if os.name == "nt":
+        try:
+            import string
+
+            for letter in string.ascii_uppercase:
+                drive = f"{letter}:\\"
+                if os.path.exists(drive):
+                    parts.append(SimpleNamespace(device=drive, mountpoint=drive))
+        except Exception:
+            pass
+    else:
+        seen = set()
+        try:
+            with open("/proc/mounts", "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    segs = line.split()
+                    if len(segs) < 2:
+                        continue
+                    device, mountpoint = segs[0], segs[1]
+                    if any(mountpoint.startswith(prefix) for prefix in ("/proc", "/sys", "/run", "/dev", "/snap")):
+                        continue
+                    if mountpoint in seen:
+                        continue
+                    seen.add(mountpoint)
+                    parts.append(SimpleNamespace(device=device, mountpoint=mountpoint))
+        except Exception:
+            pass
+        if not parts:
+            parts.append(SimpleNamespace(device="/", mountpoint="/"))
+    return parts
+
+
+def list_drives():
+    drives = []
+    for part in _disk_partitions(all=True):
+        mount = getattr(part, "mountpoint", "")
+        device = getattr(part, "device", "")
+        if mount and not os.path.exists(mount):
+            continue
+        if os.name == "nt":
+            candidate = device.rstrip("\\") or mount.rstrip("\\")
+        else:
+            candidate = mount or device
+        if not candidate:
+            continue
+        drives.append(candidate)
+    if not drives and os.name != "nt":
+        drives.append("/")
+    # Preserve order while removing duplicates
+    seen = []
+    for d in drives:
+        if d not in seen:
+            seen.append(d)
+    return seen
 
 def get_drive_label(letter):
     import ctypes
@@ -60,16 +144,33 @@ def get_drive_label(letter):
     return name or "(无名称)"
 
 def get_drive_usage_bytes(root):
-    u=psutil.disk_usage(root); return u.total,u.free
+    path = root
+    if os.name == "nt":
+        if len(path) == 2 and path[1] == ":":
+            path = path + "\\"
+        elif len(path) == 3 and path[1] == ":" and path[2] in ("/", "\\"):
+            path = path[0:2] + "\\"
+    if psutil is not None:
+        try:
+            u = psutil.disk_usage(path)
+            return u.total, u.free
+        except Exception:
+            pass
+    total, used, free = shutil.disk_usage(path)
+    return total, free
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE,"r",encoding="utf-8") as f:
             cfg = json.load(f)
-            if "theme" not in cfg: cfg["theme"] = "light"
+            theme = cfg.get("theme", DEFAULT_THEME_KEY)
+            if theme not in {DEFAULT_THEME_KEY}:
+                cfg["theme"] = DEFAULT_THEME_KEY
+            if "theme" not in cfg:
+                cfg["theme"] = DEFAULT_THEME_KEY
             if "sash_ratio" not in cfg: cfg["sash_ratio"] = 0.55
             return cfg
-    return {"last_target_root": "", "theme": "light", "sash_ratio": 0.55}
+    return {"last_target_root": "", "theme": DEFAULT_THEME_KEY, "sash_ratio": 0.55}
 
 def save_config(cfg):
     with open(CONFIG_FILE,"w",encoding="utf-8") as f: json.dump(cfg,f,ensure_ascii=False,indent=2)
@@ -85,6 +186,8 @@ def _parse_exif_str(s):
     return None
 
 def _exif_dt_from_jpg(p):
+    if Image is None:
+        return None
     try:
         im=Image.open(p); exif=im._getexif()
         if not exif: return None
@@ -98,6 +201,8 @@ def _exif_dt_from_jpg(p):
     return None
 
 def _exif_dt_from_any(p):
+    if exifread is None:
+        return None
     try:
         with open(p,"rb") as f: tags=exifread.process_file(f,stop_tag="EXIF DateTimeOriginal",details=False)
         for k in("EXIF DateTimeOriginal","Image DateTime","EXIF DateTimeDigitized"):
@@ -157,12 +262,18 @@ def unique_path(d,f):
 
 # ---------- 日志 ----------
 def log_init_if_empty(text_widget, line):
+    if text_widget is None:
+        print(f"[{ts()}] {line}")
+        return
     if float(text_widget.index("end-1c"))==1.0:
         text_widget.configure(state="normal")
         text_widget.insert("end", f"[{ts()}] {line}\n")
         text_widget.configure(state="disabled")
 
 def log_add(text_widget, line):
+    if text_widget is None:
+        print(f"[{ts()}] {line}")
+        return
     text_widget.configure(state="normal")
     text_widget.insert("end", f"[{ts()}] {line}\n")
     text_widget.see("end")
@@ -216,14 +327,27 @@ def show_finish_and_undo(root, target_dir, created_files):
 
     # 统一应用当前主题（修复暗黑/日间不匹配）
     try:
-        theme_key = load_config().get("theme", "light")
+        theme_key = load_config().get("theme", DEFAULT_THEME_KEY)
     except Exception:
-        theme_key = "light"
+        theme_key = DEFAULT_THEME_KEY
+    if theme_key not in {DEFAULT_THEME_KEY}:
+        theme_key = DEFAULT_THEME_KEY
     apply_theme(win, theme_key)
 
-    pad = {"padx": 16, "pady": 8}
-    ttk.Label(win, text="导入完成", style="WeChatTitle.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", **pad)
-    ttk.Label(win, text=f"输出目录：  {target_dir}", style="WeChatBody.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", **pad)
+    win.grid_rowconfigure(0, weight=1)
+    win.grid_columnconfigure(0, weight=1)
+
+    container = ttk.Frame(win, style="AuroraCard.TFrame", padding=(26, 22))
+    container.grid(row=0, column=0, sticky="nsew")
+    for i in range(3):
+        container.grid_columnconfigure(i, weight=1 if i == 0 else 0)
+
+    accent = ttk.Frame(container, style="AuroraAccent.TFrame", height=3)
+    accent.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 18))
+    accent.grid_propagate(False)
+
+    ttk.Label(container, text="导入完成", style="AuroraSection.TLabel").grid(row=1, column=0, columnspan=3, sticky="w")
+    ttk.Label(container, text=f"输出目录：  {target_dir}", style="AuroraBody.TLabel").grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
     def _open():
         try:
@@ -252,12 +376,12 @@ def show_finish_and_undo(root, target_dir, created_files):
         messagebox.showinfo("撤销完成", f"已删除本次导入生成的 {removed} 个文件。")
         win.destroy()
 
-    ttk.Button(win, text="打开输出文件夹", style="WeChatPrimary.TButton", command=_open)\
-        .grid(row=2, column=0, sticky="w", padx=16, pady=(10,16))
-    ttk.Button(win, text="撤销本次导入", style="WeChatSecondary.TButton", command=undo)\
-        .grid(row=2, column=1, sticky="w", padx=8,  pady=(10,16))
-    ttk.Button(win, text="关闭", style="WeChatSecondary.TButton", command=win.destroy)\
-        .grid(row=2, column=2, sticky="e", padx=16, pady=(10,16))
+    ttk.Button(container, text="打开输出文件夹", style="AuroraPrimary.TButton", command=_open)\
+        .grid(row=3, column=0, sticky="w", pady=(22, 0))
+    ttk.Button(container, text="撤销本次导入", style="AuroraSecondary.TButton", command=undo)\
+        .grid(row=3, column=1, sticky="w", padx=(16, 0), pady=(22, 0))
+    ttk.Button(container, text="关闭", style="AuroraGhost.TButton", command=win.destroy)\
+        .grid(row=3, column=2, sticky="e", padx=(16, 0), pady=(22, 0))
 
     # 计算尺寸后居中到父窗口
     win.update_idletasks()
@@ -275,7 +399,7 @@ def center_on_parent(child: tk.Toplevel, parent: tk.Tk):
     child.geometry(f"+{x}+{y}")
 
 # ---------- 复制（主界面进度，MB/s，含星标） ----------
-def copy_with_progress_seq_and_video(src_files, dst, pb, status_label, log_file, mmdd_str, info_box, total_bytes, extract_star=False):
+def copy_with_progress_seq_and_video(src_files, dst, pb, status_label, log_file, mmdd_str, info_box, total_bytes, extract_star=False, progress_hook=None):
     created=[]; done=set()
     if os.path.exists(log_file):
         with open(log_file,"r",encoding="utf-8") as f:
@@ -304,9 +428,16 @@ def copy_with_progress_seq_and_video(src_files, dst, pb, status_label, log_file,
         elapsed = max(time.time()-t0, 1e-6)
         speed_mb = bytes_done / elapsed / (1024*1024)
         pct = (bytes_done/total_bytes*100) if total_bytes>0 else 0
-        pb["value"] = min(max(pct,0),100)
-        label.config(text=f"{phase} | {bytes_to_human(bytes_done)} / {bytes_to_human(total_bytes)} | 速度 {speed_mb:.2f} MB/s")
-        label.update()
+        if pb is not None:
+            pb["value"] = min(max(pct,0),100)
+        if label is not None:
+            label.config(text=f"{phase} | {bytes_to_human(bytes_done)} / {bytes_to_human(total_bytes)} | 速度 {speed_mb:.2f} MB/s")
+            label.update()
+        if progress_hook is not None:
+            try:
+                progress_hook(phase, bytes_done, total_bytes, speed_mb)
+            except Exception:
+                pass
 
     # 照片复制与重命名
     for src,base,ext in plan:
@@ -375,38 +506,135 @@ def _update(pb,lab,copied,total,start,phase):
     lab.config(text=f"{phase} {copied}/{total} | 速度 {sp:.2f}/秒 | 预计剩余 {eta} 秒"); lab.update()
 
 # ---------- 主题 ----------
-THEME_PALETTES = {
-    "light": {"BG":"#F7F7F7","CARD":"#FFFFFF","TEXT":"#111111","SUB":"#6B6B6B","BORDER":"#E6E6E6","GREEN":"#07C160","GREEN_DARK":"#05924C","INPUT_BG":"#FFFFFF","INPUT_FG":"#111111"},
-    "dark":  {"BG":"#141414","CARD":"#1F1F1F","TEXT":"#EDEDED","SUB":"#A3A3A3","BORDER":"#2A2A2A","GREEN":"#07C160","GREEN_DARK":"#05924C","INPUT_BG":"#1F1F1F","INPUT_FG":"#EDEDED"}
+AURORA_THEME = {
+    "BG": "#050A16",
+    "HEADER_BG": "#0E1626",
+    "PANEL_BG": "#0B1322",
+    "CARD": "#111E32",
+    "CARD_HIGHLIGHT": "#17263C",
+    "CARD_BORDER": "#1F2E45",
+    "TEXT": "#F4F7FB",
+    "SUB": "#8EA3C0",
+    "STATUS": "#94A3B8",
+    "ACCENT": "#38BDF8",
+    "ACCENT_HOVER": "#0EA5E9",
+    "ACCENT_ACTIVE": "#0284C7",
+    "ACCENT_LINE": "#60A5FA",
+    "INPUT_BG": "#15243A",
+    "INPUT_FG": "#E2E8F0",
+    "INPUT_BORDER": "#1F3450",
+    "TROUGH": "#102036",
+    "SCROLLBAR_BG": "#0D182B",
+    "SCROLLBAR_FG": "#1D3554"
 }
+
+
+def _font(size, weight="normal"):
+    if weight == "bold":
+        return ("Microsoft YaHei UI", size, "bold")
+    return ("Microsoft YaHei UI", size)
+
 
 def apply_theme(root, theme_key, info_text_widget=None):
     style = ttk.Style()
-    try: style.theme_use("clam")
-    except Exception: pass
-    P = THEME_PALETTES["dark" if theme_key=="dark" else "light"]
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+
+    P = AURORA_THEME
 
     root.configure(bg=P["BG"])
-    style.configure("WeChatTitle.TLabel", background=P["BG"], foreground=P["TEXT"], font=("SimHei",18))
-    style.configure("WeChatH2.TLabel",    background=P["BG"], foreground=P["TEXT"], font=("SimHei",14))
-    style.configure("WeChatBody.TLabel",  background=P["BG"], foreground=P["TEXT"], font=("SimHei",12))
-    style.configure("WeChatSubtle.TLabel",background=P["BG"], foreground=P["SUB"],  font=("SimHei",11))
-    style.configure("WeChatFrame.TFrame", background=P["BG"])
-    style.configure("WeChatCard.TFrame",  background=P["CARD"], relief="flat")
-    style.configure("WeChatPrimary.TButton", background=P["GREEN"], foreground="#FFFFFF", font=("SimHei",12), padding=6, borderwidth=0)
-    style.map("WeChatPrimary.TButton", background=[("active", P["GREEN_DARK"])])
-    style.configure("WeChatSecondary.TButton", background="#2b2b2b" if theme_key=="dark" else "#EDEDED", foreground=P["TEXT"], font=("SimHei",12), padding=6, borderwidth=0)
-    style.map("WeChatSecondary.TButton", background=[("active", "#3a3a3a" if theme_key=="dark" else "#E0E0E0")])
-    style.configure("WeChat.Horizontal.TProgressbar", troughcolor=P["BORDER"], background=P["GREEN"], bordercolor=P["BORDER"], lightcolor=P["GREEN"], darkcolor=P["GREEN"])
-    style.configure("TCombobox", fieldbackground=P["INPUT_BG"], background=P["INPUT_BG"], foreground=P["TEXT"], bordercolor=P["BORDER"], arrowcolor=P["TEXT"])
-    style.map("TCombobox", fieldbackground=[("readonly", P["INPUT_BG"])], foreground=[("readonly", P["TEXT"])], background=[("readonly", P["INPUT_BG"])])
+    try:
+        root.option_add("*TCombobox*Listbox.background", P["CARD"])
+        root.option_add("*TCombobox*Listbox.foreground", P["TEXT"])
+        root.option_add("*TCombobox*Listbox.selectBackground", P["ACCENT"])
+        root.option_add("*TCombobox*Listbox.selectForeground", "#061427")
+    except Exception:
+        pass
+
+    style.configure("TPanedwindow", background=P["PANEL_BG"], bordercolor=P["PANEL_BG"], relief="flat")
+    style.configure("TPanedwindow.Pane", background=P["PANEL_BG"])
+
+    style.configure("AuroraHeader.TFrame", background=P["HEADER_BG"], borderwidth=0, relief="flat")
+    style.configure("AuroraPanel.TFrame", background=P["PANEL_BG"], borderwidth=0, relief="flat")
+    style.configure("AuroraCard.TFrame", background=P["CARD"], borderwidth=1, relief="flat", bordercolor=P["CARD_BORDER"])
+    style.configure("AuroraAccent.TFrame", background=P["ACCENT_LINE"])
+
+    style.configure("AuroraTitle.TLabel", background=P["HEADER_BG"], foreground=P["TEXT"], font=_font(20, "bold"))
+    style.configure("AuroraSection.TLabel", background=P["CARD"], foreground=P["TEXT"], font=_font(15, "bold"))
+    style.configure("AuroraBody.TLabel", background=P["CARD"], foreground=P["TEXT"], font=_font(12))
+    style.configure("AuroraBodyOnPanel.TLabel", background=P["HEADER_BG"], foreground=P["TEXT"], font=_font(12))
+    style.configure("AuroraSubtle.TLabel", background=P["CARD"], foreground=P["SUB"], font=_font(11))
+    style.configure("AuroraStatus.TLabel", background=P["CARD"], foreground=P["STATUS"], font=_font(11))
+    style.configure("AuroraFooter.TLabel", background=P["BG"], foreground=P["SUB"], font=_font(10))
+
+    style.configure("AuroraPrimary.TButton", background=P["ACCENT"], foreground="#051225", font=_font(12, "bold"), padding=(22, 10), borderwidth=0, focusthickness=0, focuscolor=P["ACCENT_ACTIVE"])
+    style.map(
+        "AuroraPrimary.TButton",
+        background=[("pressed", P["ACCENT_ACTIVE"]), ("active", P["ACCENT_HOVER"])],
+        foreground=[("pressed", "#E6F6FF"), ("active", "#F0F9FF")],
+    )
+
+    style.configure("AuroraSecondary.TButton", background=P["CARD_HIGHLIGHT"], foreground=P["TEXT"], font=_font(12), padding=(18, 10), borderwidth=0, focusthickness=0)
+    style.map(
+        "AuroraSecondary.TButton",
+        background=[("pressed", P["ACCENT_ACTIVE"]), ("active", P["CARD_BORDER"])],
+        foreground=[("pressed", "#F8FAFC")],
+    )
+
+    style.configure("AuroraGhost.TButton", background=P["HEADER_BG"], foreground=P["TEXT"], font=_font(11), padding=(16, 8), borderwidth=0, focusthickness=0)
+    style.map(
+        "AuroraGhost.TButton",
+        background=[("active", P["CARD_BORDER"]), ("pressed", P["ACCENT_ACTIVE"])],
+        foreground=[("pressed", "#F8FAFC")],
+    )
+
+    style.configure("Aurora.Horizontal.TProgressbar", troughcolor=P["TROUGH"], bordercolor=P["TROUGH"], background=P["ACCENT"], darkcolor=P["ACCENT_ACTIVE"], lightcolor=P["ACCENT"], thickness=10)
+
+    style.configure("Aurora.TCombobox", fieldbackground=P["INPUT_BG"], background=P["INPUT_BG"], foreground=P["INPUT_FG"], bordercolor=P["INPUT_BORDER"], arrowcolor=P["SUB"])
+    style.map(
+        "Aurora.TCombobox",
+        fieldbackground=[("readonly", P["INPUT_BG"]), ("active", P["INPUT_BG"])],
+        foreground=[("readonly", P["INPUT_FG"])],
+        background=[("readonly", P["INPUT_BG"])],
+        arrowcolor=[("active", P["ACCENT"]), ("readonly", P["SUB"])],
+    )
+
+    style.configure("Aurora.TCheckbutton", background=P["CARD"], foreground=P["TEXT"], font=_font(11))
+    style.map("Aurora.TCheckbutton", background=[("active", P["CARD_HIGHLIGHT"])], foreground=[("disabled", P["SUB"])])
+
+    style.configure("Aurora.Vertical.TScrollbar", background=P["CARD"], troughcolor=P["SCROLLBAR_BG"], bordercolor=P["CARD"], darkcolor=P["CARD"], lightcolor=P["CARD"], arrowsize=12)
+    style.map(
+        "Aurora.Vertical.TScrollbar",
+        background=[("active", P["CARD_HIGHLIGHT"]), ("pressed", P["ACCENT_ACTIVE"])],
+        arrowcolor=[("active", P["ACCENT"])],
+    )
 
     if info_text_widget is not None:
-        info_text_widget.configure(bg=P["CARD"], fg=P["TEXT"], insertbackground=P["TEXT"])
+        info_text_widget.configure(
+            bg=AURORA_THEME["CARD_HIGHLIGHT"],
+            fg=AURORA_THEME["TEXT"],
+            insertbackground=AURORA_THEME["ACCENT"],
+            highlightthickness=0,
+            relief="flat",
+            selectbackground=AURORA_THEME["ACCENT"],
+            selectforeground="#071425",
+        )
+
 
 def set_text_theme(widget, theme_key):
-    P = THEME_PALETTES["dark" if theme_key=="dark" else "light"]
-    widget.configure(bg=P["CARD"], fg=P["TEXT"], insertbackground=P["TEXT"])
+    widget.configure(
+        bg=AURORA_THEME["CARD_HIGHLIGHT"],
+        fg=AURORA_THEME["TEXT"],
+        insertbackground=AURORA_THEME["ACCENT"],
+        selectbackground=AURORA_THEME["ACCENT"],
+        selectforeground="#071425",
+        highlightthickness=0,
+        relief="flat",
+        padx=16,
+        pady=14,
+    )
 
 # ---------- 列表刷新 ----------
 def refresh_sources(info_box, combo_src, auto_pick=False):
@@ -428,13 +656,30 @@ def refresh_sources(info_box, combo_src, auto_pick=False):
 
 def refresh_dests(info_box, combo_dst):
     vals=[]
-    for p in psutil.disk_partitions(all=False):
-        letter=p.device.rstrip("\\")
-        if get_drive_type_code(letter)!=3: continue
-        total,free=get_drive_usage_bytes(letter+"\\"); label=get_drive_label(letter)
+    for part in _disk_partitions(all=False):
+        mount = getattr(part, "mountpoint", "")
+        device = getattr(part, "device", "")
+        if os.name == "nt":
+            letter = device.rstrip("\\") or mount.rstrip("\\")
+            if not letter:
+                continue
+            if get_drive_type_code(letter) != 3:
+                continue
+            label = get_drive_label(letter)
+            usage_key = letter
+        else:
+            letter = mount or device
+            if not letter:
+                continue
+            label = os.path.basename(letter) or letter
+            usage_key = letter
+        try:
+            total,free=get_drive_usage_bytes(usage_key)
+        except Exception:
+            continue
         vals.append(f"{letter} {label}（{bytes_to_human(free)} / {bytes_to_human(total)}）")
     combo_dst["values"]=vals
-    log_add(info_box,"已刷新目标固定磁盘列表")
+    log_add(info_box, "已刷新目标固定磁盘列表" if vals else "未检测到目标固定磁盘")
 
 # ---------- 复制入口 ----------
 def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_main, status_lbl, extract_star=False):
@@ -469,7 +714,11 @@ def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_mai
         "照片重命名：MMDD-0001 起；视频保留原名。"):
         log_add(info_box,"用户取消复制"); return
 
-    if dst_letter: target_root=dst_letter+"\\"
+    if dst_letter:
+        if os.name == "nt" and not dst_letter.endswith("\\"):
+            target_root = dst_letter + "\\"
+        else:
+            target_root = dst_letter
     else:
         target_root=cfg.get("last_target_root","")
         if not os.path.exists(target_root):
@@ -488,7 +737,8 @@ def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_mai
     log_add(info_box,f"目标目录：{target_dir}")
 
     try:
-        _,dst_free=get_drive_usage_bytes(os.path.splitdrive(target_root)[0]+"\\")
+        usage_key = dst_letter or target_root
+        _,dst_free=get_drive_usage_bytes(usage_key)
         if dst_free<total_size:
             log_add(info_box,f"目标剩余 {bytes_to_human(dst_free)} < 需要 {bytes_to_human(total_size)}")
             if not messagebox.askretrycancel("空间不足",
@@ -529,72 +779,261 @@ def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_mai
     beep_done()
     show_finish_and_undo(root, target_dir, created)
 
+# ---------- CLI 模式 ----------
+def _prompt_directory(prompt, allow_create=False):
+    while True:
+        try:
+            raw = input(prompt).strip().strip('"')
+        except EOFError:
+            return None
+        if not raw:
+            print("输入不能为空，请重新输入。")
+            continue
+        path = os.path.abspath(raw)
+        if os.path.isdir(path):
+            return path
+        if allow_create:
+            try:
+                os.makedirs(path, exist_ok=True)
+                return path
+            except Exception as exc:
+                print(f"创建目录失败：{exc}")
+        print("目录不存在，请重新输入。")
+
+
+def run_cli(reason=None):
+    if reason:
+        msg = f"[提示] {reason}，已切换到命令行模式。按 Ctrl+C 可随时中断。"
+    else:
+        msg = "[提示] 已切换到命令行模式。按 Ctrl+C 可随时中断。"
+    print(msg)
+
+    try:
+        src_root = None
+        while src_root is None:
+            src_root = _prompt_directory("请输入素材所在的文件夹路径：")
+            if src_root is None:
+                print("未获得有效路径，已退出。")
+                return
+            counts, sizes, files = preflight_scan(src_root)
+            total_files = counts["RAW"] + counts["JPG"] + counts["VIDEO"]
+            total_size = sizes["RAW"] + sizes["JPG"] + sizes["VIDEO"]
+            if total_files == 0:
+                print("该目录内未检测到可处理的照片或视频，请重新选择。")
+                src_root = None
+
+        dst_root = _prompt_directory("请输入导入目标根目录（例如备份硬盘）：", allow_create=True)
+        if dst_root is None:
+            print("未获得有效目标目录，已退出。")
+            return
+
+        print("可选拍摄类型：")
+        for idx, name in enumerate(CATEGORIES, 1):
+            print(f"  {idx}. {name}")
+        while True:
+            try:
+                sel = input("请选择拍摄类型（输入序号，默认 1）：").strip()
+            except EOFError:
+                print("未获得输入，已退出。")
+                return
+            if not sel:
+                category = CATEGORIES[0]
+                break
+            if sel.isdigit() and 1 <= int(sel) <= len(CATEGORIES):
+                category = CATEGORIES[int(sel)-1]
+                break
+            print("输入无效，请重新输入。")
+
+        default_name = os.path.basename(os.path.normpath(src_root)) or "作品"
+        try:
+            shoot_name = input(f"请输入拍摄主题（默认：{default_name}）：").strip()
+        except EOFError:
+            print("未获得输入，已退出。")
+            return
+        if not shoot_name:
+            shoot_name = default_name
+
+        try:
+            star_answer = input("是否提取星标照片？(y/N)：").strip().lower()
+        except EOFError:
+            star_answer = ""
+        extract_star = star_answer in {"y", "yes", "是"}
+
+        print("\n预检结果：")
+        print(f"  RAW: {counts['RAW']} 张，共 {bytes_to_human(sizes['RAW'])}")
+        print(f"  JPG: {counts['JPG']} 张，共 {bytes_to_human(sizes['JPG'])}")
+        print(f"  VIDEO: {counts['VIDEO']} 个，共 {bytes_to_human(sizes['VIDEO'])}")
+        total_size = sizes["RAW"] + sizes["JPG"] + sizes["VIDEO"]
+        print(f"  总计：{total_files} 个文件，约 {bytes_to_human(total_size)}")
+
+        today = datetime.now()
+        year_dir = os.path.join(dst_root, f"{today.year}")
+        cat_dir = os.path.join(year_dir, category)
+        month_dir = os.path.join(cat_dir, f"{today.month:02d}月")
+        day_folder = f"{today.month:02d}.{today.day:02d}_{shoot_name}"
+        target_dir = os.path.join(month_dir, day_folder)
+        os.makedirs(target_dir, exist_ok=True)
+
+        try:
+            usage_key = dst_root
+            _, dst_free = get_drive_usage_bytes(usage_key)
+        except Exception:
+            dst_free = None
+        if dst_free is not None and dst_free < total_size:
+            print(f"[警告] 目标磁盘剩余 {bytes_to_human(dst_free)}，低于预计需要的 {bytes_to_human(total_size)}。")
+            try:
+                cont = input("是否继续？(y/N)：").strip().lower()
+            except EOFError:
+                cont = ""
+            if cont not in {"y", "yes", "是"}:
+                print("用户取消导入。")
+                return
+
+        print(f"\n导入目标目录：{target_dir}")
+        log_file = os.path.join(target_dir, "copy_log.txt")
+        mmdd_str = f"{today.month:02d}{today.day:02d}"
+
+        print("开始复制，请稍候…")
+        beep_start()
+
+        last_emit = 0.0
+
+        def progress_hook(phase, done_bytes, total_bytes, speed_mb):
+            nonlocal last_emit
+            now = time.time()
+            if now - last_emit < 0.5 and done_bytes < total_bytes:
+                return
+            pct = (done_bytes / total_bytes * 100) if total_bytes else 0.0
+            print(f"[{ts()}] {phase} {pct:5.1f}% | {bytes_to_human(done_bytes)} / {bytes_to_human(total_bytes)} | 速度 {speed_mb:.2f} MB/s", end="\r" if done_bytes < total_bytes else "\n")
+            last_emit = now
+
+        created = []
+        try:
+            created = copy_with_progress_seq_and_video(
+                files, target_dir, None, None, log_file, mmdd_str, None,
+                total_bytes=total_size, extract_star=extract_star, progress_hook=progress_hook
+            )
+        except KeyboardInterrupt:
+            print("\n用户中断，正在清理未完成的复制文件…")
+            for p in created:
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+            return
+
+        print("\n复制完成！")
+        beep_done()
+        print(f"本次共生成 {len(created)} 个文件。")
+
+        ts2 = datetime.now().strftime("%Y%m%d_%H%M%S")
+        manifest_path = os.path.join(target_dir, f"import_manifest_{ts2}.json")
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "version": VERSION,
+                "created_at": ts2,
+                "source": src_root,
+                "target_dir": target_dir,
+                "category": category,
+                "files": created,
+                "extract_star": extract_star,
+            }, f, ensure_ascii=False, indent=2)
+        print(f"导入清单已保存：{manifest_path}")
+        print("感谢使用命令行模式。")
+    except KeyboardInterrupt:
+        print("\n用户取消操作。")
+
+
 # ---------- UI（分割窗可拖动） ----------
 def main_ui():
     cfg = load_config()
-    theme_key = cfg.get("theme","light")
+    theme_key = cfg.get("theme", DEFAULT_THEME_KEY)
+    if theme_key not in {DEFAULT_THEME_KEY}:
+        theme_key = DEFAULT_THEME_KEY
     sash_ratio = float(cfg.get("sash_ratio", 0.55))
 
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except Exception:
+        print("[提示] 无法初始化图形界面，自动切换到命令行模式。")
+        run_cli(reason="无法初始化图形界面")
+        return
     root.title(f"陈同学影像管理助手  {VERSION}")
-    root.geometry("1000x720")
-    root.minsize(860, 600)
+    root.geometry("1120x760")
+    root.minsize(900, 620)
     root.resizable(True, True)
 
     apply_theme(root, theme_key)
 
-    # 顶部栏
-    header = ttk.Frame(root, style="WeChatFrame.TFrame")
-    header.grid(row=0, column=0, sticky="ew", padx=0, pady=(10,0))
-    ttk.Label(header, text="照片/视频导入与分类", style="WeChatTitle.TLabel").grid(row=0, column=0, sticky="w", padx=(20,10))
-
-    ttk.Label(header, text="主题", style="WeChatBody.TLabel").grid(row=0, column=1, sticky="e")
-    theme_box = ttk.Combobox(header, state="readonly", values=THEMES, width=6)
-    theme_box.grid(row=0, column=2, sticky="w", padx=(6,0))
-    theme_box.set("日间" if theme_key=="light" else "暗黑")
-
-    # 分割窗
-    paned = ttk.Panedwindow(root, orient="vertical")
-    paned.grid(row=1, column=0, sticky="nsew", padx=20, pady=(10,6))
     root.grid_rowconfigure(1, weight=1)
     root.grid_columnconfigure(0, weight=1)
 
-    top_frame = ttk.Frame(paned, style="WeChatFrame.TFrame")
-    bottom_frame = ttk.Frame(paned, style="WeChatFrame.TFrame")
+    # 顶部栏
+    header = ttk.Frame(root, style="AuroraHeader.TFrame", padding=(32, 26))
+    header.grid(row=0, column=0, sticky="ew", padx=36, pady=(28, 16))
+    header.columnconfigure(0, weight=1)
+    accent = ttk.Frame(header, style="AuroraAccent.TFrame", height=4)
+    accent.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 20))
+    accent.grid_propagate(False)
+    ttk.Label(header, text="照片/视频导入与分类", style="AuroraTitle.TLabel").grid(row=1, column=0, sticky="w")
+    ttk.Label(header, text="主题", style="AuroraBodyOnPanel.TLabel").grid(row=1, column=1, sticky="e", padx=(24, 10))
+    theme_box = ttk.Combobox(header, state="readonly", values=THEMES, width=8, style="Aurora.TCombobox")
+    theme_box.grid(row=1, column=2, sticky="e")
+    theme_box.set(THEMES[0])
+
+    # 分割窗
+    paned = ttk.Panedwindow(root, orient="vertical")
+    paned.grid(row=1, column=0, sticky="nsew", padx=36, pady=(0, 28))
+    try:
+        paned.configure(sashrelief="flat", sashwidth=6)
+    except Exception:
+        pass
+
+    top_frame = ttk.Frame(paned, style="AuroraPanel.TFrame")
+    bottom_frame = ttk.Frame(paned, style="AuroraPanel.TFrame")
     paned.add(top_frame, weight=3)
     paned.add(bottom_frame, weight=5)
 
+    top_frame.grid_columnconfigure(0, weight=1)
+    bottom_frame.grid_columnconfigure(0, weight=1)
+    bottom_frame.grid_rowconfigure(0, weight=1)
+
     # 顶部：设置
-    card1 = ttk.Frame(top_frame, style="WeChatCard.TFrame", padding=16)
+    card1 = ttk.Frame(top_frame, style="AuroraCard.TFrame", padding=(28, 26))
     card1.grid(row=0, column=0, sticky="ew")
     card1.grid_columnconfigure(1, weight=1)
-    ttk.Label(card1, text="导入设置", style="WeChatH2.TLabel").grid(row=0, column=0, sticky="w", pady=(0,6), columnspan=5)
+    ttk.Label(card1, text="导入设置", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 16), columnspan=5)
 
-    ttk.Label(card1, text="选择素材盘", style="WeChatBody.TLabel").grid(row=1, column=0, sticky="e", padx=(0,8))
-    combo_src = ttk.Combobox(card1, state="readonly", width=70); combo_src.grid(row=1, column=1, sticky="ew")
-    ttk.Button(card1, text="刷新", style="WeChatSecondary.TButton",
-               command=lambda: refresh_sources(info_box, combo_src, auto_pick=True)).grid(row=1, column=2, padx=(8,0))
+    ttk.Label(card1, text="选择素材盘", style="AuroraBody.TLabel").grid(row=1, column=0, sticky="e", padx=(0, 12))
+    combo_src = ttk.Combobox(card1, state="readonly", width=70, style="Aurora.TCombobox")
+    combo_src.grid(row=1, column=1, sticky="ew")
+    ttk.Button(card1, text="刷新", style="AuroraGhost.TButton",
+               command=lambda: refresh_sources(info_box, combo_src, auto_pick=True)).grid(row=1, column=2, padx=(14, 0))
 
-    ttk.Label(card1, text="拷入到", style="WeChatBody.TLabel").grid(row=2, column=0, sticky="e", padx=(0,8), pady=(8,0))
-    combo_dst = ttk.Combobox(card1, state="readonly", width=50); combo_dst.grid(row=2, column=1, sticky="w", pady=(8,0))
-    ttk.Button(card1, text="刷新", style="WeChatSecondary.TButton",
-               command=lambda: refresh_dests(info_box, combo_dst)).grid(row=2, column=2, padx=(8,0), pady=(8,0))
+    ttk.Label(card1, text="拷入到", style="AuroraBody.TLabel").grid(row=2, column=0, sticky="e", padx=(0, 12), pady=(14, 0))
+    combo_dst = ttk.Combobox(card1, state="readonly", width=50, style="Aurora.TCombobox")
+    combo_dst.grid(row=2, column=1, sticky="ew", pady=(14, 0))
+    ttk.Button(card1, text="刷新", style="AuroraGhost.TButton",
+               command=lambda: refresh_dests(info_box, combo_dst)).grid(row=2, column=2, padx=(14, 0), pady=(14, 0))
 
-    ttk.Label(card1, text="拍摄类型", style="WeChatBody.TLabel").grid(row=3, column=0, sticky="e", padx=(0,8), pady=(8,0))
-    combo_cat = ttk.Combobox(card1, state="readonly", values=CATEGORIES, width=20); combo_cat.grid(row=3, column=1, sticky="w", pady=(8,0))
+    ttk.Label(card1, text="拍摄类型", style="AuroraBody.TLabel").grid(row=3, column=0, sticky="e", padx=(0, 12), pady=(14, 0))
+    combo_cat = ttk.Combobox(card1, state="readonly", values=CATEGORIES, width=20, style="Aurora.TCombobox")
+    combo_cat.grid(row=3, column=1, sticky="w", pady=(14, 0))
     combo_cat.current(0)
 
     star_var = tk.BooleanVar(value=False)
-    chk_star = ttk.Checkbutton(card1, text="提取星标照片", variable=star_var)
-    chk_star.grid(row=3, column=2, sticky="w", padx=(12,0), pady=(8,0))
+    chk_star = ttk.Checkbutton(card1, text="提取星标照片", variable=star_var, style="Aurora.TCheckbutton")
+    chk_star.grid(row=3, column=2, sticky="w", padx=(18, 0), pady=(14, 0))
 
     # 顶部：操作 + 进度
-    card3 = ttk.Frame(top_frame, style="WeChatCard.TFrame", padding=16)
-    card3.grid(row=1, column=0, sticky="ew", pady=(10,0))
-    pb_main = ttk.Progressbar(card3, style="WeChat.Horizontal.TProgressbar", orient="horizontal", length=560, mode="determinate")
-    pb_main.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0,8))
-    status_lbl = ttk.Label(card3, text="待机", style="WeChatSubtle.TLabel")
-    status_lbl.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0,6))
+    card3 = ttk.Frame(top_frame, style="AuroraCard.TFrame", padding=(28, 24))
+    card3.grid(row=1, column=0, sticky="ew", pady=(20, 0))
+    card3.grid_columnconfigure(0, weight=1)
+    pb_main = ttk.Progressbar(card3, style="Aurora.Horizontal.TProgressbar", orient="horizontal", mode="determinate")
+    pb_main.grid(row=0, column=0, columnspan=2, sticky="ew")
+    status_lbl = ttk.Label(card3, text="待机", style="AuroraStatus.TLabel")
+    status_lbl.grid(row=1, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
     def start_action():
         sv = combo_src.get()
@@ -605,31 +1044,31 @@ def main_ui():
         start_copy(src_drive, dst_letter, load_config(), root, combo_cat.get().strip(),
                    info_box, btn_start, pb_main, status_lbl, extract_star=star_var.get())
 
-    btn_start = ttk.Button(card3, text="开始分类", style="WeChatPrimary.TButton", command=start_action)
-    btn_start.grid(row=2, column=0, padx=(0,8))
-    ttk.Button(card3, text="退出", style="WeChatSecondary.TButton", command=root.destroy).grid(row=2, column=1)
+    btn_start = ttk.Button(card3, text="开始分类", style="AuroraPrimary.TButton", command=start_action)
+    btn_start.grid(row=2, column=0, sticky="w", pady=(18, 0))
+    ttk.Button(card3, text="退出", style="AuroraSecondary.TButton", command=root.destroy).grid(row=2, column=1, sticky="e", padx=(18, 0), pady=(18, 0))
 
     # 底部：日志
-    card2 = ttk.Frame(bottom_frame, style="WeChatCard.TFrame", padding=16)
+    card2 = ttk.Frame(bottom_frame, style="AuroraCard.TFrame", padding=(28, 24))
     card2.grid(row=0, column=0, sticky="nsew")
-    bottom_frame.grid_rowconfigure(0, weight=1)
-    bottom_frame.grid_columnconfigure(0, weight=1)
+    card2.grid_rowconfigure(1, weight=1)
+    card2.grid_columnconfigure(0, weight=1)
 
-    ttk.Label(card2, text="信息", style="WeChatH2.TLabel").grid(row=0, column=0, sticky="w", pady=(0,6))
+    ttk.Label(card2, text="信息", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 16))
     info_box = tk.Text(card2, height=10, wrap="word", bd=0, relief="flat", state="disabled")
     set_text_theme(info_box, theme_key)
     info_box.grid(row=1, column=0, sticky="nsew")
-    card2.grid_rowconfigure(1, weight=1)
-    card2.grid_columnconfigure(0, weight=1)
-    sb = ttk.Scrollbar(card2, command=info_box.yview); sb.grid(row=1, column=1, sticky="ns")
+    sb = ttk.Scrollbar(card2, command=info_box.yview, orient="vertical", style="Aurora.Vertical.TScrollbar")
+    sb.grid(row=1, column=1, sticky="ns", padx=(16, 0))
     info_box.configure(yscrollcommand=sb.set)
+
+    footer = ttk.Label(root, text="此软件完全免费，请勿倒卖！ by: 抖音@摄影师陈同学", style="AuroraFooter.TLabel", anchor="center")
+    footer.grid(row=2, column=0, pady=(0, 18))
 
     # 主题切换
     def on_theme_change(event=None):
-        sel = theme_box.get()
-        key = "light" if sel == "日间" else "dark"
-        cfg2 = load_config(); cfg2["theme"] = key; save_config(cfg2)
-        apply_theme(root, key, info_text_widget=info_box); set_text_theme(info_box, key)
+        cfg2 = load_config(); cfg2["theme"] = DEFAULT_THEME_KEY; save_config(cfg2)
+        apply_theme(root, DEFAULT_THEME_KEY, info_text_widget=info_box); set_text_theme(info_box, DEFAULT_THEME_KEY)
     theme_box.bind("<<ComboboxSelected>>", on_theme_change)
 
     # 初始化扫描
@@ -640,9 +1079,6 @@ def main_ui():
         msg = ("此软件完全免费，请勿倒卖！\nby: 抖音 @摄影师陈同学\nCopyright © 2025")
         messagebox.showinfo("版权声明", msg)
     root.after(500, _copyright_popup)
-    footer = ttk.Label(root, text="此软件完全免费，请勿倒卖！ by: 抖音@摄影师陈同学", style="WeChatSubtle.TLabel", anchor="center")
-    footer.grid(row=2, column=0, pady=(2,8))
-
     # 分割比例恢复/保存
     def apply_sash_ratio_later():
         try:
@@ -674,5 +1110,56 @@ def main_ui():
 
     root.mainloop()
 
-if __name__=="__main__":
+
+def print_usage():
+    print("""用法:
+  python photo_sorter.py [选项]
+
+选项:
+  -h, --help    显示此帮助信息并退出。
+  --cli         强制使用命令行模式。
+  --gui         即使在检测到可能的无显示环境时也尝试启动图形界面。
+
+默认行为:
+  若存在图形显示环境则启动图形界面，否则自动回退到命令行模式。
+""")
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if any(arg in ("-h", "--help") for arg in argv):
+        print_usage()
+        return 0
+
+    recognized = {"--cli", "--gui"}
+    unknown = [arg for arg in argv if arg not in recognized]
+    if unknown:
+        print(f"[错误] 未识别的参数：{' '.join(unknown)}")
+        print_usage()
+        return 1
+
+    force_cli = "--cli" in argv
+    force_gui = "--gui" in argv
+
+    if force_cli and force_gui:
+        print("[错误] --cli 与 --gui 不能同时使用。")
+        print_usage()
+        return 1
+
+    if force_cli:
+        run_cli(reason="根据命令行参数 --cli")
+        return 0
+
+    headless = (os.name != "nt" and not os.environ.get("DISPLAY"))
+    if headless and not force_gui:
+        run_cli(reason="检测到无图形显示环境")
+        return 0
+
     main_ui()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
