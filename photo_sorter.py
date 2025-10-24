@@ -7,7 +7,7 @@
 # - 弹窗统一 Aurora 风格并适配暗黑主题
 # - 新增 Aurora 风格文本输入弹窗，统一拍摄名称输入体验
 
-import os, sys, json, time, shutil, platform, subprocess, re
+import os, sys, json, time, shutil, platform, subprocess, re, threading
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from datetime import datetime
@@ -19,6 +19,8 @@ CONFIG_FILE = "photo_sorter_config.json"
 CATEGORIES = ["婚礼", "写真", "日常记录", "旅游记录", "商业活动拍摄"]
 THEMES = ["暗黑"]
 DEFAULT_THEME_KEY = "dark"
+LOG_PANEL_WIDTH = 360
+COPY_BUFFER_SIZE = 4 * 1024 * 1024
 
 SUPPRESS_RUNTIME_WARNINGS = any(arg in ("-h", "--help") for arg in sys.argv[1:])
 
@@ -281,6 +283,34 @@ def log_add(text_widget, line):
     text_widget.see("end")
     text_widget.configure(state="disabled")
 
+
+def rollback_files(paths, target_root):
+    removed = 0
+    root_abs = os.path.abspath(target_root)
+    for path in reversed(paths):
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                removed += 1
+        except Exception:
+            pass
+    prune_candidates = set()
+    for path in paths:
+        parent = os.path.dirname(path)
+        while parent and parent.startswith(root_abs):
+            prune_candidates.add(parent)
+            next_parent = os.path.dirname(parent)
+            if next_parent == parent:
+                break
+            parent = next_parent
+    for folder in sorted(prune_candidates, key=len, reverse=True):
+        try:
+            if os.path.isdir(folder) and not os.listdir(folder):
+                os.rmdir(folder)
+        except Exception:
+            pass
+    return removed
+
 # ---------- 扫描/计划 ----------
 def preflight_scan(src_root):
     counts={"RAW":0,"JPG":0,"VIDEO":0}; sizes={"RAW":0,"JPG":0,"VIDEO":0}
@@ -401,90 +431,185 @@ def center_on_parent(child: tk.Toplevel, parent: tk.Tk):
     child.geometry(f"+{x}+{y}")
 
 # ---------- 复制（主界面进度，MB/s，含星标） ----------
-def copy_with_progress_seq_and_video(src_files, dst, pb, status_label, log_file, mmdd_str, info_box, total_bytes, extract_star=False, progress_hook=None):
-    created=[]; done=set()
+def copy_with_progress_seq_and_video(
+    src_files,
+    dst,
+    pb,
+    status_label,
+    log_file,
+    mmdd_str,
+    info_box,
+    total_bytes,
+    extract_star=False,
+    progress_hook=None,
+    cancel_ev=None,
+    pause_ev=None,
+    log_func=None,
+    on_file_done=None,
+):
+    created = []
+    done = set()
     if os.path.exists(log_file):
-        with open(log_file,"r",encoding="utf-8") as f:
+        with open(log_file, "r", encoding="utf-8") as f:
             for line in f:
                 if line.startswith("完成: "):
-                    done.add(line.split("完成: ",1)[1].split(" -> ",1)[0].strip())
+                    done.add(line.split("完成: ", 1)[1].split(" -> ", 1)[0].strip())
 
-    photo_files=src_files["RAW"]+src_files["JPG"]; video_files=src_files["VIDEO"]
+    photo_files = src_files["RAW"] + src_files["JPG"]
+    video_files = src_files["VIDEO"]
 
-    raw_dir=os.path.join(dst,"RAW"); jpg_dir=os.path.join(dst,"JPG"); vid_dir=os.path.join(dst,"VIDEO")
-    os.makedirs(raw_dir,exist_ok=True); os.makedirs(jpg_dir,exist_ok=True); os.makedirs(vid_dir,exist_ok=True)
+    raw_dir = os.path.join(dst, "RAW")
+    jpg_dir = os.path.join(dst, "JPG")
+    vid_dir = os.path.join(dst, "VIDEO")
+    os.makedirs(raw_dir, exist_ok=True)
+    os.makedirs(jpg_dir, exist_ok=True)
+    os.makedirs(vid_dir, exist_ok=True)
 
     star_root = os.path.join(dst, "已星标照片")
-    star_jpg  = os.path.join(star_root, "已星标JPG")
-    star_raw  = os.path.join(star_root, "已星标RAW")
+    star_jpg = os.path.join(star_root, "已星标JPG")
+    star_raw = os.path.join(star_root, "已星标RAW")
     if extract_star:
-        os.makedirs(star_jpg, exist_ok=True); os.makedirs(star_raw, exist_ok=True)
+        os.makedirs(star_jpg, exist_ok=True)
+        os.makedirs(star_raw, exist_ok=True)
 
-    plan=build_seq_plan(photo_files,mmdd_str)
+    plan = build_seq_plan(photo_files, mmdd_str)
     final_map = {}
+
+    log = log_func if log_func is not None else (lambda line: log_add(info_box, line))
 
     bytes_done = 0
     t0 = time.time()
+    last_emit = 0.0
 
-    def _upd(label, phase):
-        elapsed = max(time.time()-t0, 1e-6)
-        speed_mb = bytes_done / elapsed / (1024*1024)
-        pct = (bytes_done/total_bytes*100) if total_bytes>0 else 0
+    def emit_progress(phase, *, force=False):
+        nonlocal last_emit
+        now = time.time()
+        if not force and now - last_emit < 0.1 and total_bytes and bytes_done < total_bytes:
+            return
+        elapsed = max(time.time() - t0, 1e-6)
+        speed_mb = bytes_done / elapsed / (1024 * 1024)
+        pct = (bytes_done / total_bytes * 100) if total_bytes else 0
         if pb is not None:
-            pb["value"] = min(max(pct,0),100)
-        if label is not None:
-            label.config(text=f"{phase} | {bytes_to_human(bytes_done)} / {bytes_to_human(total_bytes)} | 速度 {speed_mb:.2f} MB/s")
-            label.update()
+            pb["value"] = min(max(pct, 0), 100)
+        if status_label is not None:
+            status_label.config(
+                text=f"{phase} | {bytes_to_human(bytes_done)} / {bytes_to_human(total_bytes)} | 速度 {speed_mb:.2f} MB/s"
+            )
+            try:
+                status_label.update_idletasks()
+            except Exception:
+                pass
         if progress_hook is not None:
             try:
                 progress_hook(phase, bytes_done, total_bytes, speed_mb)
             except Exception:
                 pass
+        last_emit = now
+
+    def check_flow():
+        if cancel_ev is not None and cancel_ev.is_set():
+            raise KeyboardInterrupt
+        if pause_ev is not None:
+            while pause_ev.is_set():
+                if cancel_ev is not None and cancel_ev.is_set():
+                    raise KeyboardInterrupt
+                time.sleep(0.1)
+
+    def copy_stream(src_path, dst_path, phase):
+        nonlocal bytes_done
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        copied = 0
+        try:
+            with open(src_path, "rb") as fsrc, open(dst_path, "wb") as fdst:
+                while True:
+                    check_flow()
+                    chunk = fsrc.read(COPY_BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    fdst.write(chunk)
+                    copied += len(chunk)
+                    bytes_done += len(chunk)
+                    emit_progress(phase)
+            try:
+                shutil.copystat(src_path, dst_path)
+            except Exception:
+                pass
+        except KeyboardInterrupt:
+            try:
+                if os.path.exists(dst_path):
+                    os.remove(dst_path)
+            except Exception:
+                pass
+            raise
+        except Exception:
+            try:
+                if os.path.exists(dst_path):
+                    os.remove(dst_path)
+            except Exception:
+                pass
+            raise
+        emit_progress(phase, force=True)
+        return copied
 
     # 照片复制与重命名
-    for src,base,ext in plan:
+    for src, base, ext in plan:
+        check_flow()
         if src in done:
-            _upd(status_label, "照片")
+            try:
+                bytes_done += os.path.getsize(src)
+            except Exception:
+                pass
+            emit_progress("照片")
             continue
-        td=raw_dir if is_raw_ext(ext) else jpg_dir
-        dst_path=unique_path(td,f"{base}.{ext}")
+        td = raw_dir if is_raw_ext(ext) else jpg_dir
+        dst_path = unique_path(td, f"{base}.{ext}")
         try:
-            size = 0
-            try: size = os.path.getsize(src)
-            except Exception: size = 0
-            shutil.copy2(src,dst_path); created.append(dst_path); final_map[src] = dst_path
-            with open(log_file,"a",encoding="utf-8") as f: f.write(f"完成: {src} -> {os.path.basename(dst_path)}\n")
-            bytes_done += size
-            if int(time.time()*10)%3==0:  # 轻量更新频率
-                log_add(info_box,f"复制：{os.path.basename(dst_path)}")
+            copy_stream(src, dst_path, "照片")
+            created.append(dst_path)
+            final_map[src] = dst_path
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"完成: {src} -> {os.path.basename(dst_path)}\n")
+            if on_file_done is not None:
+                on_file_done(dst_path)
+            if int(time.time() * 10) % 3 == 0:
+                log(f"复制：{os.path.basename(dst_path)}")
+        except KeyboardInterrupt:
+            raise
         except Exception as e:
-            with open(log_file,"a",encoding="utf-8") as f: f.write(f"错误: {src} | {e}\n")
-        _upd(status_label, "照片")
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"错误: {src} | {e}\n")
 
     # 视频复制（保留原名）
     for src in video_files:
+        check_flow()
         if src in done:
-            _upd(status_label, "视频"); continue
-        dst_path=unique_path(vid_dir,os.path.basename(src))
+            try:
+                bytes_done += os.path.getsize(src)
+            except Exception:
+                pass
+            emit_progress("视频")
+            continue
+        dst_path = unique_path(vid_dir, os.path.basename(src))
         try:
-            size = 0
-            try: size = os.path.getsize(src)
-            except Exception: size = 0
-            shutil.copy2(src,dst_path); created.append(dst_path)
-            with open(log_file,"a",encoding="utf-8") as f: f.write(f"完成: {src} -> {os.path.basename(dst_path)}\n")
-            bytes_done += size
+            copy_stream(src, dst_path, "视频")
+            created.append(dst_path)
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"完成: {src} -> {os.path.basename(dst_path)}\n")
+            if on_file_done is not None:
+                on_file_done(dst_path)
+        except KeyboardInterrupt:
+            raise
         except Exception as e:
-            with open(log_file,"a",encoding="utf-8") as f: f.write(f"错误: {src} | {e}\n")
-        _upd(status_label, "视频")
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"错误: {src} | {e}\n")
 
-    # 进度条就绪到 100%
-    _upd(status_label, "收尾")
+    emit_progress("收尾", force=True)
 
-    # 星标复制不计入总进度，只追加日志
     if extract_star:
-        log_add(info_box, "开始提取星标照片…")
+        log("开始提取星标照片…")
         star_count = 0
         for src, base, ext in plan:
+            check_flow()
             try:
                 if is_starred_file(src):
                     src_copied_path = final_map.get(src, src)
@@ -494,10 +619,15 @@ def copy_with_progress_seq_and_video(src_files, dst, pb, status_label, log_file,
                         dst_star = unique_path(star_raw, os.path.basename(src_copied_path))
                     shutil.copy2(src_copied_path, dst_star)
                     created.append(dst_star)
+                    if on_file_done is not None:
+                        on_file_done(dst_star)
                     star_count += 1
+            except KeyboardInterrupt:
+                raise
             except Exception as e:
-                with open(log_file,"a",encoding="utf-8") as f: f.write(f"星标复制错误: {src} | {e}\n")
-        log_add(info_box, f"星标提取完成，共 {star_count} 个文件")
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(f"星标复制错误: {src} | {e}\n")
+        log(f"星标提取完成，共 {star_count} 个文件")
 
     return created
 
@@ -583,6 +713,21 @@ def apply_theme(root, theme_key, info_text_widget=None):
         "AuroraSecondary.TButton",
         background=[("pressed", P["ACCENT_ACTIVE"]), ("active", P["CARD_BORDER"])],
         foreground=[("pressed", "#F8FAFC")],
+    )
+
+    style.configure(
+        "Danger.TButton",
+        background="#B91C1C",
+        foreground="#F8FAFC",
+        font=_font(12, "bold"),
+        padding=(18, 10),
+        borderwidth=0,
+        focusthickness=0,
+    )
+    style.map(
+        "Danger.TButton",
+        background=[("active", "#DC2626"), ("pressed", "#7F1D1D")],
+        foreground=[("pressed", "#FEE2E2")],
     )
 
     style.configure("AuroraGhost.TButton", background=P["HEADER_BG"], foreground=P["TEXT"], font=_font(11), padding=(16, 8), borderwidth=0, focusthickness=0)
@@ -952,37 +1097,68 @@ def refresh_dests(info_box, combo_dst):
     log_add(info_box, "已刷新目标固定磁盘列表" if vals else "未检测到目标固定磁盘")
 
 # ---------- 复制入口 ----------
-def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_main, status_lbl, extract_star=False):
+def start_copy(
+    src_drive,
+    dst_letter,
+    cfg,
+    root,
+    category,
+    info_box,
+    btn_start,
+    pb_main,
+    status_lbl,
+    pause_btn,
+    cancel_btn,
+    state,
+    extract_star=False,
+):
+    if state.is_copying:
+        log_add(info_box, "已有任务正在进行，请稍后。")
+        return
+
     if not category:
-        aurora_showwarning("提示","请先选择拍摄类型。", parent=root); return
-    dtype=drive_type_name(get_drive_type_code(src_drive))
-    log_add(info_box,f"素材盘：{src_drive}（{get_drive_label(src_drive)} | {dtype}）")
+        aurora_showwarning("提示", "请先选择拍摄类型。", parent=root)
+        return
+
+    dtype = drive_type_name(get_drive_type_code(src_drive))
+    log_add(info_box, f"素材盘：{src_drive}（{get_drive_label(src_drive)} | {dtype}）")
     if is_system_drive(src_drive):
-        if not aurora_askyesno("高风险确认",f"{src_drive} 是系统盘，不建议作为素材盘源。继续？", parent=root): return
-        if not aurora_askyesno("二次确认","再次确认从系统盘作为相机源复制？", parent=root): return
-    elif get_drive_type_code(src_drive)!=2:
-        if not aurora_askyesno("固定磁盘警告",f"{src_drive} 为固定盘，通常应选移动盘。继续？", parent=root): return
+        if not aurora_askyesno("高风险确认", f"{src_drive} 是系统盘，不建议作为素材盘源。继续？", parent=root):
+            return
+        if not aurora_askyesno("二次确认", "再次确认从系统盘作为相机源复制？", parent=root):
+            return
+    elif get_drive_type_code(src_drive) != 2:
+        if not aurora_askyesno("固定磁盘警告", f"{src_drive} 为固定盘，通常应选移动盘。继续？", parent=root):
+            return
 
-    shoot_name=aurora_askstring("本次拍摄名称","输入拍摄地点或主题（可中文）：", parent=root, initialvalue="")
-    if not shoot_name: return
+    shoot_name = aurora_askstring("本次拍摄名称", "输入拍摄地点或主题（可中文）：", parent=root, initialvalue="")
+    if not shoot_name:
+        return
 
-    total_b,free_b=get_drive_usage_bytes(src_drive)
-    log_add(info_box,f"素材盘容量：{bytes_to_human(total_b)} | 剩余：{bytes_to_human(free_b)}")
-    log_add(info_box,"开始预检源文件…")
-    counts,sizes,files=preflight_scan(src_drive)
-    total_files=counts["RAW"]+counts["JPG"]+counts["VIDEO"]
-    total_size =sizes["RAW"] +sizes["JPG"] +sizes["VIDEO"]
-    log_add(info_box,f"预检完成 RAW:{counts['RAW']} JPG:{counts['JPG']} VIDEO:{counts['VIDEO']} 合计:{total_files} | 体积 {bytes_to_human(total_size)}")
+    total_b, free_b = get_drive_usage_bytes(src_drive)
+    log_add(info_box, f"素材盘容量：{bytes_to_human(total_b)} | 剩余：{bytes_to_human(free_b)}")
+    log_add(info_box, "开始预检源文件…")
+    counts, sizes, files = preflight_scan(src_drive)
+    total_files = counts["RAW"] + counts["JPG"] + counts["VIDEO"]
+    total_size = sizes["RAW"] + sizes["JPG"] + sizes["VIDEO"]
+    log_add(
+        info_box,
+        f"预检完成 RAW:{counts['RAW']} JPG:{counts['JPG']} VIDEO:{counts['VIDEO']} 合计:{total_files} | 体积 {bytes_to_human(total_size)}",
+    )
 
-    if not aurora_askyesno("确认复制",
+    if not aurora_askyesno(
+        "确认复制",
         "预检完成：\n"
         f"RAW：{counts['RAW']}（{bytes_to_human(sizes['RAW'])}）\n"
         f"JPG：{counts['JPG']}（{bytes_to_human(sizes['JPG'])}）\n"
         f"VIDEO：{counts['VIDEO']}（{bytes_to_human(sizes['VIDEO'])}）\n"
         f"合计：{total_files}（{bytes_to_human(total_size)}）\n\n"
         "将复制到：年/拍摄类型/“MM月”/“MM.DD_拍摄名”/（RAW,JPG,VIDEO，及可选已星标照片）\n"
-        "照片重命名：MMDD-0001 起；视频保留原名。"):
-        log_add(info_box,"用户取消复制"); return
+        "照片重命名：MMDD-0001 起；视频保留原名。",
+        parent=root,
+    ):
+        log_add(info_box, "用户取消复制")
+        return
 
     if dst_letter:
         if os.name == "nt" and not dst_letter.endswith("\\"):
@@ -990,65 +1166,167 @@ def start_copy(src_drive,dst_letter,cfg,root,category,info_box,btn_start, pb_mai
         else:
             target_root = dst_letter
     else:
-        target_root=cfg.get("last_target_root","")
+        target_root = cfg.get("last_target_root", "")
         if not os.path.exists(target_root):
-            target_root=filedialog.askdirectory(title="选择目标硬盘文件夹（建议为外置硬盘根目录）")
-            if not target_root: return
-    cfg["last_target_root"]=target_root; save_config(cfg)
-    if os.path.splitdrive(target_root)[0].upper()==os.path.splitdrive(src_drive)[0].upper():
-        if not aurora_askyesno("风险提示","目标盘与素材盘相同盘符，建议不同物理盘。继续？", parent=root): return
+            target_root = filedialog.askdirectory(title="选择目标硬盘文件夹（建议为外置硬盘根目录）")
+            if not target_root:
+                return
+    cfg["last_target_root"] = target_root
+    save_config(cfg)
+    if os.path.splitdrive(target_root)[0].upper() == os.path.splitdrive(src_drive)[0].upper():
+        if not aurora_askyesno("风险提示", "目标盘与素材盘相同盘符，建议不同物理盘。继续？", parent=root):
+            return
 
-    today=datetime.now()
-    year_dir=os.path.join(target_root,str(today.year))
-    cat_dir=os.path.join(year_dir,category)
-    month_dir=os.path.join(cat_dir,f"{today.month:02d}月")
-    day_folder=f"{today.month:02d}.{today.day:02d}_{shoot_name}"
-    target_dir=os.path.join(month_dir,day_folder); os.makedirs(target_dir,exist_ok=True)
-    log_add(info_box,f"目标目录：{target_dir}")
+    today = datetime.now()
+    year_dir = os.path.join(target_root, str(today.year))
+    cat_dir = os.path.join(year_dir, category)
+    month_dir = os.path.join(cat_dir, f"{today.month:02d}月")
+    day_folder = f"{today.month:02d}.{today.day:02d}_{shoot_name}"
+    target_dir = os.path.join(month_dir, day_folder)
+    os.makedirs(target_dir, exist_ok=True)
+    log_add(info_box, f"目标目录：{target_dir}")
 
     try:
         usage_key = dst_letter or target_root
-        _,dst_free=get_drive_usage_bytes(usage_key)
-        if dst_free<total_size:
-            log_add(info_box,f"目标剩余 {bytes_to_human(dst_free)} < 需要 {bytes_to_human(total_size)}")
-            if not aurora_askretrycancel("空间不足",
+        _, dst_free = get_drive_usage_bytes(usage_key)
+        if dst_free < total_size:
+            log_add(info_box, f"目标剩余 {bytes_to_human(dst_free)} < 需要 {bytes_to_human(total_size)}")
+            if not aurora_askretrycancel(
+                "空间不足",
                 f"目标剩余 {bytes_to_human(dst_free)}，预计需要 {bytes_to_human(total_size)}。清理后重试。",
-                parent=root):
+                parent=root,
+            ):
                 return
-    except Exception: pass
+    except Exception:
+        pass
 
-    log_file=os.path.join(target_dir,"copy_log.txt")
-    mmdd_str=f"{today.month:02d}{today.day:02d}"
+    log_file = os.path.join(target_dir, "copy_log.txt")
+    mmdd_str = f"{today.month:02d}{today.day:02d}"
 
-    # —— 主界面进度初始化 —— #
     pb_main["value"] = 0
+    pb_main["maximum"] = 100
     status_lbl.config(text="准备复制…")
     root.update_idletasks()
 
-    # 开始提示音
     beep_start()
-    log_add(info_box,"开始复制…")
+    log_add(info_box, "开始复制…")
 
     btn_start.configure(state="disabled")
-    try:
-        created=copy_with_progress_seq_and_video(
-            files, target_dir, pb_main, status_lbl, log_file, mmdd_str, info_box,
-            total_bytes=total_size, extract_star=extract_star
-        )
-    finally:
-        btn_start.configure(state="normal")
+    pause_btn.config(state="disabled", text="暂停")
+    cancel_btn.config(state="disabled")
 
-    log_add(info_box,f"复制完成 共 {len(created)} 个目标文件")
-    status_lbl.config(text="复制完成")
+    state.is_copying = True
+    state.is_paused = False
+    state.cancel_ev.clear()
+    state.pause_ev.clear()
+    state.copied_paths.clear()
 
-    ts2=datetime.now().strftime("%Y%m%d_%H%M%S")
-    with open(os.path.join(target_dir,f"import_manifest_{ts2}.json"),"w",encoding="utf-8") as f:
-        json.dump({"version":VERSION,"created_at":ts2,"source_drive":src_drive,"target_dir":target_dir,"files":created},
-                  f,ensure_ascii=False,indent=2)
+    def safe_log(message):
+        root.after(0, lambda m=message: log_add(info_box, m))
 
-    # 完成提示音 + 撤销窗口
-    beep_done()
-    show_finish_and_undo(root, target_dir, created)
+    def progress_cb(phase, done_bytes, total, speed_mb):
+        def _update():
+            if not state.is_copying:
+                return
+            pct = (done_bytes / total * 100) if total else (100 if phase == "收尾" else 0)
+            pb_main["value"] = max(0, min(100, pct))
+            status_lbl.config(
+                text=f"{phase} | {bytes_to_human(done_bytes)} / {bytes_to_human(total)} | 速度 {speed_mb:.2f} MB/s"
+            )
+        root.after(0, _update)
+
+    def on_file_done(path):
+        state.copied_paths.append(path)
+
+    def worker():
+        created = []
+        cancelled = False
+        error = None
+        manifest_path = None
+        try:
+            created = copy_with_progress_seq_and_video(
+                files,
+                target_dir,
+                None,
+                None,
+                log_file,
+                mmdd_str,
+                None,
+                total_bytes=total_size,
+                extract_star=extract_star,
+                progress_hook=progress_cb,
+                cancel_ev=state.cancel_ev,
+                pause_ev=state.pause_ev,
+                log_func=safe_log,
+                on_file_done=on_file_done,
+            )
+        except KeyboardInterrupt:
+            cancelled = True
+        except Exception as exc:
+            error = exc
+
+        if state.cancel_ev.is_set():
+            cancelled = True
+
+        if cancelled or error is not None:
+            removed = rollback_files(list(state.copied_paths), target_dir)
+        else:
+            removed = 0
+            ts2 = datetime.now().strftime("%Y%m%d_%H%M%S")
+            manifest_path = os.path.join(target_dir, f"import_manifest_{ts2}.json")
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "version": VERSION,
+                        "created_at": ts2,
+                        "source_drive": src_drive,
+                        "target_dir": target_dir,
+                        "files": created,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+        def finalize():
+            state.is_copying = False
+            state.is_paused = False
+            state.pause_ev.clear()
+            state.cancel_ev.clear()
+            state.copied_paths.clear()
+
+            btn_start.configure(state="normal")
+            pause_btn.config(state="disabled", text="暂停")
+            cancel_btn.config(state="disabled")
+
+            if cancelled:
+                pb_main["value"] = 0
+                status_lbl.config(text="已取消")
+                log_add(info_box, "已取消并回滚")
+                if removed:
+                    log_add(info_box, f"已清理 {removed} 个文件")
+            elif error is not None:
+                status_lbl.config(text="复制失败")
+                log_add(info_box, f"复制失败：{error}")
+                if removed:
+                    log_add(info_box, f"已清理 {removed} 个文件")
+                aurora_showwarning("复制失败", f"发生错误：{error}", parent=root)
+            else:
+                pb_main["value"] = 100
+                status_lbl.config(text="复制完成")
+                log_add(info_box, f"复制完成 共 {len(created)} 个目标文件")
+                if manifest_path:
+                    log_add(info_box, f"清单已保存：{manifest_path}")
+                beep_done()
+                show_finish_and_undo(root, target_dir, created)
+
+        root.after(0, finalize)
+
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
+
+    pause_btn.config(state="normal", text="暂停")
+    cancel_btn.config(state="normal")
 
 # ---------- CLI 模式 ----------
 def _prompt_directory(prompt, allow_create=False):
@@ -1222,7 +1500,6 @@ def main_ui():
     theme_key = cfg.get("theme", DEFAULT_THEME_KEY)
     if theme_key not in {DEFAULT_THEME_KEY}:
         theme_key = DEFAULT_THEME_KEY
-    sash_ratio = float(cfg.get("sash_ratio", 0.55))
 
     try:
         root = tk.Tk()
@@ -1231,18 +1508,26 @@ def main_ui():
         run_cli(reason="无法初始化图形界面")
         return
     root.title(f"陈同学影像管理助手  {VERSION}")
-    root.geometry("1120x760")
-    root.minsize(900, 620)
+    root.geometry("1180x760")
+    root.minsize(960, 640)
     root.resizable(True, True)
 
     apply_theme(root, theme_key)
 
     root.grid_rowconfigure(1, weight=1)
     root.grid_columnconfigure(0, weight=1)
+    root.grid_columnconfigure(1, weight=0)
 
-    # 顶部栏
+    state = SimpleNamespace(
+        cancel_ev=threading.Event(),
+        pause_ev=threading.Event(),
+        is_copying=False,
+        is_paused=False,
+        copied_paths=[],
+    )
+
     header = ttk.Frame(root, style="AuroraHeader.TFrame", padding=(32, 26))
-    header.grid(row=0, column=0, sticky="ew", padx=36, pady=(28, 16))
+    header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=36, pady=(28, 16))
     header.columnconfigure(0, weight=1)
     accent = ttk.Frame(header, style="AuroraAccent.TFrame", height=4)
     accent.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 20))
@@ -1253,25 +1538,34 @@ def main_ui():
     theme_box.grid(row=1, column=2, sticky="e")
     theme_box.set(THEMES[0])
 
-    # 分割窗
-    paned = ttk.Panedwindow(root, orient="vertical")
-    paned.grid(row=1, column=0, sticky="nsew", padx=36, pady=(0, 28))
-    try:
-        paned.configure(sashrelief="flat", sashwidth=6)
-    except Exception:
-        pass
+    main_frame = ttk.Frame(root, style="AuroraPanel.TFrame")
+    main_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=36, pady=(0, 28))
+    main_frame.grid_columnconfigure(0, weight=1)
+    main_frame.grid_columnconfigure(1, weight=0)
+    main_frame.grid_rowconfigure(0, weight=1)
 
-    top_frame = ttk.Frame(paned, style="AuroraPanel.TFrame")
-    bottom_frame = ttk.Frame(paned, style="AuroraPanel.TFrame")
-    paned.add(top_frame, weight=3)
-    paned.add(bottom_frame, weight=5)
+    right_col = ttk.Frame(main_frame, style="AuroraPanel.TFrame", width=LOG_PANEL_WIDTH)
+    right_col.grid(row=0, column=1, sticky="ns")
+    right_col.grid_propagate(False)
+    right_col.grid_rowconfigure(0, weight=1)
 
-    top_frame.grid_columnconfigure(0, weight=1)
-    bottom_frame.grid_columnconfigure(0, weight=1)
-    bottom_frame.grid_rowconfigure(0, weight=1)
+    log_card = ttk.Frame(right_col, style="AuroraCard.TFrame", padding=(28, 24))
+    log_card.grid(row=0, column=0, sticky="nsew")
+    log_card.grid_rowconfigure(1, weight=1)
+    log_card.grid_columnconfigure(0, weight=1)
+    ttk.Label(log_card, text="信息", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 16))
+    info_box = tk.Text(log_card, height=10, wrap="word", bd=0, relief="flat", state="disabled")
+    set_text_theme(info_box, theme_key)
+    info_box.grid(row=1, column=0, sticky="nsew")
+    sb = ttk.Scrollbar(log_card, command=info_box.yview, orient="vertical", style="Aurora.Vertical.TScrollbar")
+    sb.grid(row=1, column=1, sticky="ns", padx=(16, 0))
+    info_box.configure(yscrollcommand=sb.set)
 
-    # 顶部：设置
-    card1 = ttk.Frame(top_frame, style="AuroraCard.TFrame", padding=(28, 26))
+    left_col = ttk.Frame(main_frame, style="AuroraPanel.TFrame")
+    left_col.grid(row=0, column=0, sticky="nsew")
+    left_col.grid_columnconfigure(0, weight=1)
+
+    card1 = ttk.Frame(left_col, style="AuroraCard.TFrame", padding=(28, 26))
     card1.grid(row=0, column=0, sticky="ew")
     card1.grid_columnconfigure(1, weight=1)
     ttk.Label(card1, text="导入设置", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 16), columnspan=5)
@@ -1297,87 +1591,93 @@ def main_ui():
     chk_star = ttk.Checkbutton(card1, text="提取星标照片", variable=star_var, style="Aurora.TCheckbutton")
     chk_star.grid(row=3, column=2, sticky="w", padx=(18, 0), pady=(14, 0))
 
-    # 顶部：操作 + 进度
-    card3 = ttk.Frame(top_frame, style="AuroraCard.TFrame", padding=(28, 24))
+    card3 = ttk.Frame(left_col, style="AuroraCard.TFrame", padding=(28, 24))
     card3.grid(row=1, column=0, sticky="ew", pady=(20, 0))
     card3.grid_columnconfigure(0, weight=1)
+    card3.grid_columnconfigure(1, weight=0)
+    card3.grid_columnconfigure(2, weight=0)
     pb_main = ttk.Progressbar(card3, style="Aurora.Horizontal.TProgressbar", orient="horizontal", mode="determinate")
-    pb_main.grid(row=0, column=0, columnspan=2, sticky="ew")
+    pb_main.grid(row=0, column=0, columnspan=3, sticky="ew")
     status_lbl = ttk.Label(card3, text="待机", style="AuroraStatus.TLabel")
-    status_lbl.grid(row=1, column=0, columnspan=2, sticky="w", pady=(12, 0))
+    status_lbl.grid(row=1, column=0, columnspan=3, sticky="w", pady=(12, 0))
+
+    def on_pause():
+        if not state.is_copying:
+            return
+        if not state.is_paused:
+            state.pause_ev.set()
+            state.is_paused = True
+            pause_btn.config(text="继续")
+            status_lbl.config(text="已暂停")
+            log_add(info_box, "已暂停")
+        else:
+            state.pause_ev.clear()
+            state.is_paused = False
+            pause_btn.config(text="暂停")
+            log_add(info_box, "继续执行")
+
+    def on_cancel():
+        if not state.is_copying:
+            return
+        if not aurora_askyesno(
+            "确认取消",
+            "还没复制完，是否取消？\n（取消会撤回本次所有未复制完成的文件）",
+            parent=root,
+        ):
+            return
+        cancel_btn.config(state="disabled")
+        pause_btn.config(state="disabled")
+        state.cancel_ev.set()
+        status_lbl.config(text="取消中…")
+        log_add(info_box, "取消中…")
 
     def start_action():
+        if state.is_copying:
+            return
         sv = combo_src.get()
         if not sv:
-            aurora_showwarning("提示","请先选择素材盘。", parent=root); return
-        src_drive = sv.split("|",1)[0].strip()
-        dst_letter = combo_dst.get().split(" ",1)[0].strip().rstrip("\\") if combo_dst.get() else ""
-        start_copy(src_drive, dst_letter, load_config(), root, combo_cat.get().strip(),
-                   info_box, btn_start, pb_main, status_lbl, extract_star=star_var.get())
+            aurora_showwarning("提示", "请先选择素材盘。", parent=root)
+            return
+        src_drive = sv.split("|", 1)[0].strip()
+        dst_letter = combo_dst.get().split(" ", 1)[0].strip().rstrip("\\") if combo_dst.get() else ""
+        start_copy(
+            src_drive,
+            dst_letter,
+            load_config(),
+            root,
+            combo_cat.get().strip(),
+            info_box,
+            btn_start,
+            pb_main,
+            status_lbl,
+            pause_btn,
+            cancel_btn,
+            state,
+            extract_star=star_var.get(),
+        )
 
     btn_start = ttk.Button(card3, text="开始分类", style="AuroraPrimary.TButton", command=start_action)
     btn_start.grid(row=2, column=0, sticky="w", pady=(18, 0))
-    ttk.Button(card3, text="退出", style="AuroraSecondary.TButton", command=root.destroy).grid(row=2, column=1, sticky="e", padx=(18, 0), pady=(18, 0))
 
-    # 底部：日志
-    card2 = ttk.Frame(bottom_frame, style="AuroraCard.TFrame", padding=(28, 24))
-    card2.grid(row=0, column=0, sticky="nsew")
-    card2.grid_rowconfigure(1, weight=1)
-    card2.grid_columnconfigure(0, weight=1)
+    pause_btn = ttk.Button(card3, text="暂停", style="AuroraSecondary.TButton", command=on_pause, state="disabled")
+    pause_btn.grid(row=2, column=1, sticky="e", padx=(18, 0), pady=(18, 0))
 
-    ttk.Label(card2, text="信息", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 16))
-    info_box = tk.Text(card2, height=10, wrap="word", bd=0, relief="flat", state="disabled")
-    set_text_theme(info_box, theme_key)
-    info_box.grid(row=1, column=0, sticky="nsew")
-    sb = ttk.Scrollbar(card2, command=info_box.yview, orient="vertical", style="Aurora.Vertical.TScrollbar")
-    sb.grid(row=1, column=1, sticky="ns", padx=(16, 0))
-    info_box.configure(yscrollcommand=sb.set)
+    cancel_btn = ttk.Button(card3, text="取消", style="Danger.TButton", command=on_cancel, state="disabled")
+    cancel_btn.grid(row=2, column=2, sticky="e", padx=(16, 0), pady=(18, 0))
 
     footer = ttk.Label(root, text="此软件完全免费，请勿倒卖！ by: 抖音@摄影师陈同学", style="AuroraFooter.TLabel", anchor="center")
-    footer.grid(row=2, column=0, pady=(0, 18))
+    footer.grid(row=2, column=0, columnspan=2, pady=(0, 18))
 
-    # 主题切换
     def on_theme_change(event=None):
-        cfg2 = load_config(); cfg2["theme"] = DEFAULT_THEME_KEY; save_config(cfg2)
-        apply_theme(root, DEFAULT_THEME_KEY, info_text_widget=info_box); set_text_theme(info_box, DEFAULT_THEME_KEY)
+        cfg2 = load_config()
+        cfg2["theme"] = DEFAULT_THEME_KEY
+        save_config(cfg2)
+        apply_theme(root, DEFAULT_THEME_KEY, info_text_widget=info_box)
+        set_text_theme(info_box, DEFAULT_THEME_KEY)
+
     theme_box.bind("<<ComboboxSelected>>", on_theme_change)
 
-    # 初始化扫描
     refresh_sources(info_box, combo_src, auto_pick=True)
-
-    # 版权
-    def _copyright_popup():
-        msg = ("此软件完全免费，请勿倒卖！\nby: 抖音 @摄影师陈同学\nCopyright © 2025")
-        aurora_showinfo("版权声明", msg, parent=root)
-    root.after(500, _copyright_popup)
-    # 分割比例恢复/保存
-    def apply_sash_ratio_later():
-        try:
-            root.update_idletasks()
-            total_h = paned.winfo_height()
-            if total_h <= 0:
-                root.after(100, apply_sash_ratio_later); return
-            pos = int(total_h * float(load_config().get("sash_ratio", 0.55)))
-            try:
-                paned.sashpos(0, max(120, min(total_h-160, pos)))
-            except Exception:
-                pass
-        except Exception:
-            pass
-    root.after(300, apply_sash_ratio_later)
-
-    def remember_sash(event=None):
-        try:
-            root.update_idletasks()
-            total_h = paned.winfo_height()
-            pos = paned.sashpos(0)
-            ratio = round(pos / max(total_h, 1), 4)
-            cfg3 = load_config(); cfg3["sash_ratio"] = max(0.15, min(0.85, ratio))
-            save_config(cfg3)
-        except Exception:
-            pass
-    paned.bind("<ButtonRelease-1>", remember_sash)
-    root.bind("<Configure>", lambda e: root.after(50, remember_sash))
 
     root.mainloop()
 
