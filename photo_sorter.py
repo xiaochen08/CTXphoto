@@ -1,4 +1,4 @@
-# 陈同学影像管理助手 v1.7.4
+# 陈同学影像管理助手 v1.7.5
 # 更新点：
 # - 开始/完成提示音
 # - 复制过程无弹窗；主界面显示进度与速度（MB/s）
@@ -6,7 +6,7 @@
 # - 保留星标提取、撤销、主题切换、可拖动分割、稳定日志、容量显示修复、版权提示
 # - 弹窗统一 Aurora 风格并适配暗黑主题
 # - 新增 Aurora 风格文本输入弹窗，统一拍摄名称输入体验
-# - 进度条升级为圆角凹槽并新增百分比显示，支持快速打开当月目录、星标按钮联动复选框与统一按钮样式
+# - 星标提取按钮直接切换状态并记录日志，进度条实时刷新显示百分比，按钮风格保持一致
 
 import os, sys, json, time, shutil, platform, subprocess, re, threading
 import tkinter as tk
@@ -15,7 +15,7 @@ from datetime import datetime
 
 from types import SimpleNamespace
 
-VERSION = "v1.7.4"
+VERSION = "v1.7.5"
 CONFIG_FILE = "photo_sorter_config.json"
 CATEGORIES = ["婚礼", "写真", "日常记录", "旅游记录", "商业活动拍摄"]
 THEMES = ["暗黑"]
@@ -559,8 +559,6 @@ def copy_with_progress_seq_and_video(
     def emit_progress(phase, *, force=False):
         nonlocal last_emit
         now = time.time()
-        if not force and now - last_emit < 0.1 and total_bytes and bytes_done < total_bytes:
-            return
         elapsed = max(time.time() - t0, 1e-6)
         speed_mb = bytes_done / elapsed / (1024 * 1024)
         pct = (bytes_done / total_bytes * 100) if total_bytes else 0
@@ -881,40 +879,40 @@ def apply_theme(root, theme_key, info_text_widget=None):
     style.configure("AuroraStatus.TLabel", background=P["CARD"], foreground=P["STATUS"], font=_font(11))
     style.configure("AuroraFooter.TLabel", background=P["BG"], foreground=P["SUB"], font=_font(10))
 
-    style.configure("AuroraPrimary.TButton", background=P["ACCENT"], foreground="#051225", font=_font(12, "bold"), padding=(22, 10), borderwidth=0, focusthickness=0, focuscolor=P["ACCENT_ACTIVE"])
-    style.map(
-        "AuroraPrimary.TButton",
+    button_base = dict(
+        background=P["ACCENT"],
+        foreground="#051225",
+        font=_font(12, "bold"),
+        padding=(22, 10),
+        borderwidth=0,
+        focusthickness=0,
+        focuscolor=P["ACCENT_ACTIVE"],
+    )
+    button_map = dict(
         background=[("pressed", P["ACCENT_ACTIVE"]), ("active", P["ACCENT_HOVER"])],
         foreground=[("pressed", "#E6F6FF"), ("active", "#F0F9FF")],
     )
 
-    style.configure("AuroraSecondary.TButton", background=P["CARD_HIGHLIGHT"], foreground=P["TEXT"], font=_font(12), padding=(18, 10), borderwidth=0, focusthickness=0)
-    style.map(
-        "AuroraSecondary.TButton",
-        background=[("pressed", P["ACCENT_ACTIVE"]), ("active", P["CARD_BORDER"])],
-        foreground=[("pressed", "#F8FAFC")],
-    )
+    style.configure("AuroraPrimary.TButton", **button_base)
+    style.map("AuroraPrimary.TButton", **button_map)
+
+    for name in ("AuroraSecondary.TButton", "AuroraGhost.TButton", "Danger.TButton"):
+        style.configure(name, **button_base)
+        style.map(name, **button_map)
 
     style.configure(
-        "Danger.TButton",
-        background="#B91C1C",
+        "AuroraSuccess.TButton",
+        background="#4CAF50",
         foreground="#F8FAFC",
         font=_font(12, "bold"),
-        padding=(18, 10),
+        padding=(22, 10),
         borderwidth=0,
         focusthickness=0,
     )
     style.map(
-        "Danger.TButton",
-        background=[("active", "#DC2626"), ("pressed", "#7F1D1D")],
-        foreground=[("pressed", "#FEE2E2")],
-    )
-
-    style.configure("AuroraGhost.TButton", background=P["HEADER_BG"], foreground=P["TEXT"], font=_font(11), padding=(16, 8), borderwidth=0, focusthickness=0)
-    style.map(
-        "AuroraGhost.TButton",
-        background=[("active", P["CARD_BORDER"]), ("pressed", P["ACCENT_ACTIVE"])],
-        foreground=[("pressed", "#F8FAFC")],
+        "AuroraSuccess.TButton",
+        background=[("active", "#67C566"), ("pressed", "#2F7C31")],
+        foreground=[("pressed", "#E8FCE8"), ("active", "#F8FFFA")],
     )
 
     style.configure("Aurora.Horizontal.TProgressbar", troughcolor=P["TROUGH"], bordercolor=P["TROUGH"], background=P["ACCENT"], darkcolor=P["ACCENT_ACTIVE"], lightcolor=P["ACCENT"], thickness=10)
@@ -1290,7 +1288,7 @@ def start_copy(
     pause_btn,
     cancel_btn,
     star_btn,
-    star_check,
+    star_refresh_cb,
     state,
     progress_var=None,
     extract_star=False,
@@ -1394,7 +1392,7 @@ def start_copy(
 
     pb_main.reset()
     if progress_var is not None:
-        progress_var.set("进度：0%")
+        progress_var.set("进度：0.0%")
     status_lbl.config(text="准备复制…")
     root.update_idletasks()
 
@@ -1405,7 +1403,6 @@ def start_copy(
     pause_btn.config(state="disabled", text="暂停")
     cancel_btn.config(state="disabled")
     star_btn.config(state="disabled")
-    star_check.config(state="disabled")
 
     state.is_copying = True
     state.is_paused = False
@@ -1420,14 +1417,18 @@ def start_copy(
         def _update():
             if not state.is_copying:
                 return
-            pct = (done_bytes / total * 100) if total else (100 if phase == "收尾" else 0)
+            pct = (done_bytes / total * 100) if total else (100.0 if phase == "收尾" else 0.0)
             pct = max(0.0, min(100.0, pct))
             pb_main.set_value(pct)
             if progress_var is not None:
-                progress_var.set(f"进度：{int(round(pct))}%")
+                progress_var.set(f"进度：{pct:.1f}%")
             status_lbl.config(
                 text=f"{phase} | {bytes_to_human(done_bytes)} / {bytes_to_human(total)} | 速度 {speed_mb:.2f} MB/s"
             )
+            try:
+                root.update_idletasks()
+            except Exception:
+                pass
         root.after(0, _update)
 
     def on_file_done(path):
@@ -1496,12 +1497,16 @@ def start_copy(
             pause_btn.config(state="disabled", text="暂停")
             cancel_btn.config(state="disabled")
             star_btn.config(state="normal")
-            star_check.config(state="normal")
+            if star_refresh_cb is not None:
+                try:
+                    star_refresh_cb()
+                except Exception:
+                    pass
 
             if cancelled:
                 pb_main.reset()
                 if progress_var is not None:
-                    progress_var.set("进度：0%")
+                    progress_var.set("进度：0.0%")
                 status_lbl.config(text="已取消")
                 log_add(info_box, "已取消并回滚")
                 if removed:
@@ -1512,7 +1517,7 @@ def start_copy(
             elif error is not None:
                 pb_main.reset()
                 if progress_var is not None:
-                    progress_var.set("进度：0%")
+                    progress_var.set("进度：0.0%")
                 status_lbl.config(text="复制失败")
                 log_add(info_box, f"复制失败：{error}")
                 if removed:
@@ -1524,7 +1529,7 @@ def start_copy(
             else:
                 pb_main.set_value(100)
                 if progress_var is not None:
-                    progress_var.set("进度：100%")
+                    progress_var.set("进度：100.0%")
                 status_lbl.config(text="复制完成")
                 log_add(info_box, f"复制完成 共 {len(created)} 个目标文件")
                 if manifest_path:
@@ -1801,29 +1806,18 @@ def main_ui():
     combo_cat.grid(row=3, column=1, sticky="w", pady=(14, 0))
     combo_cat.current(0)
 
-    star_guard_var = tk.BooleanVar(value=False)
-    star_ready_var = tk.BooleanVar(value=False)
+    extract_star_enabled = False
 
-    def _sync_star_button():
-        star_btn.config(text=f"提取星标照片 {'√' if star_ready_var.get() else '×'}")
-
-    def on_star_check():
-        if star_guard_var.get():
-            log_add(info_box, "已勾选提取星标复选框")
-        else:
-            if star_ready_var.get():
-                star_ready_var.set(False)
-                _sync_star_button()
-            log_add(info_box, "已取消提取星标复选框，星标提取将停用")
+    def refresh_star_button_visual():
+        suffix = "√" if extract_star_enabled else "×"
+        style_name = "AuroraSuccess.TButton" if extract_star_enabled else "AuroraPrimary.TButton"
+        star_btn.config(text=f"提取星标照片 {suffix}", style=style_name)
 
     def toggle_star():
-        if not star_guard_var.get():
-            log_add(info_box, "请先勾选“提取星标”复选框，再点击按钮。")
-            return
-        new_state = not star_ready_var.get()
-        star_ready_var.set(new_state)
-        _sync_star_button()
-        log_add(info_box, "已开启星标提取" if new_state else "已关闭星标提取")
+        nonlocal extract_star_enabled
+        extract_star_enabled = not extract_star_enabled
+        refresh_star_button_visual()
+        log_add(info_box, "已启用星标提取" if extract_star_enabled else "已关闭星标提取")
 
     star_btn = ttk.Button(
         card1,
@@ -1833,14 +1827,7 @@ def main_ui():
     )
     star_btn.grid(row=3, column=2, sticky="w", padx=(18, 0), pady=(14, 0))
 
-    star_check = ttk.Checkbutton(
-        card1,
-        text="启用",
-        style="Aurora.TCheckbutton",
-        variable=star_guard_var,
-        command=on_star_check,
-    )
-    star_check.grid(row=3, column=3, sticky="w", padx=(12, 0), pady=(14, 0))
+    refresh_star_button_visual()
 
     card3 = ttk.Frame(left_col, style="AuroraCard.TFrame", padding=(28, 24))
     card3.grid(row=1, column=0, sticky="ew", pady=(20, 0))
@@ -1851,7 +1838,7 @@ def main_ui():
     card3.grid_columnconfigure(4, weight=0)
     pb_main = AuroraProgressBar(card3)
     pb_main.grid(row=0, column=0, columnspan=4, sticky="ew")
-    progress_pct_var = tk.StringVar(value="进度：0%")
+    progress_pct_var = tk.StringVar(value="进度：0.0%")
     ttk.Label(card3, textvariable=progress_pct_var, style="AuroraStatus.TLabel").grid(
         row=0, column=4, sticky="e", padx=(16, 0)
     )
@@ -1931,7 +1918,7 @@ def main_ui():
             return
         src_drive = sv.split("|", 1)[0].strip()
         dst_letter = combo_dst.get().split(" ", 1)[0].strip().rstrip("\\") if combo_dst.get() else ""
-        extract_star_flag = star_guard_var.get() and star_ready_var.get()
+        extract_star_flag = extract_star_enabled
         start_copy(
             src_drive,
             dst_letter,
@@ -1945,7 +1932,7 @@ def main_ui():
             pause_btn,
             cancel_btn,
             star_btn,
-            star_check,
+            refresh_star_button_visual,
             state,
             progress_pct_var,
             extract_star=extract_star_flag,
