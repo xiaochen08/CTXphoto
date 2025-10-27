@@ -1,4 +1,4 @@
-# 陈同学影像管理助手 v1.7.6
+# 陈同学影像管理助手 v1.7.7
 # 更新点：
 # - 开始/完成提示音
 # - 复制过程无弹窗；主界面显示进度与速度（MB/s）
@@ -8,6 +8,7 @@
 # - 新增 Aurora 风格文本输入弹窗，统一拍摄名称输入体验
 # - 星标提取按钮直接切换状态并记录日志，进度条实时刷新显示百分比，按钮风格保持一致
 # - 复制进度改为队列驱动刷新，彻底消除跨线程 UI 调用引发的卡顿
+# - 全新动画进度条：真实进度优先，缺失数据时模拟推进，确保界面流畅
 
 import os, sys, json, time, shutil, platform, subprocess, re, threading, queue
 import tkinter as tk
@@ -16,7 +17,7 @@ from datetime import datetime
 
 from types import SimpleNamespace
 
-VERSION = "v1.7.6"
+VERSION = "v1.7.7"
 CONFIG_FILE = "photo_sorter_config.json"
 CATEGORIES = ["婚礼", "写真", "日常记录", "旅游记录", "商业活动拍摄"]
 THEMES = ["暗黑"]
@@ -734,111 +735,6 @@ def _font(size, weight="normal"):
     return ("Microsoft YaHei UI", size)
 
 
-class AuroraProgressBar(ttk.Frame):
-    def __init__(self, master, height=14, **kwargs):
-        super().__init__(master, **kwargs)
-        self._height = height
-        self._radius = height / 2
-        self._value = 0.0
-        self._width = 0
-        self.canvas = tk.Canvas(
-            self,
-            height=height,
-            bd=0,
-            highlightthickness=0,
-            relief="flat",
-            bg=AURORA_THEME["CARD"],
-        )
-        self.canvas.pack(fill="both", expand=True)
-        self._trough = None
-        self._bar = None
-        self._shine = None
-        self.bind("<Configure>", self._on_resize)
-
-    def _rounded_points(self, x1, y1, x2, y2, radius):
-        r = max(0.0, min(radius, (x2 - x1) / 2.0, (y2 - y1) / 2.0))
-        if r <= 0:
-            return [x1, y1, x2, y1, x2, y2, x1, y2]
-        return [
-            x1 + r,
-            y1,
-            x2 - r,
-            y1,
-            x2,
-            y1,
-            x2,
-            y1 + r,
-            x2,
-            y2 - r,
-            x2,
-            y2,
-            x2 - r,
-            y2,
-            x1 + r,
-            y2,
-            x1,
-            y2,
-            x1,
-            y2 - r,
-            x1,
-            y1 + r,
-            x1,
-            y1,
-        ]
-
-    def _draw_trough(self):
-        if self._trough is not None:
-            self.canvas.delete(self._trough)
-        points = self._rounded_points(2, 2, self._width - 2, self._height - 2, self._radius)
-        self._trough = self.canvas.create_polygon(
-            *points,
-            smooth=True,
-            splinesteps=36,
-            fill=AURORA_THEME["TROUGH"],
-            outline=AURORA_THEME["CARD_BORDER"],
-            width=1,
-        )
-
-    def _ensure_bar(self):
-        if self._bar is None:
-            self._bar = self.canvas.create_polygon(0, 0, 0, 0, fill=AURORA_THEME["ACCENT"], outline="", smooth=True)
-        if self._shine is None:
-            self._shine = self.canvas.create_polygon(0, 0, 0, 0, fill=AURORA_THEME["ACCENT_HOVER"], outline="", smooth=True, stipple="gray25")
-
-    def _set_bar_width(self, width):
-        self._ensure_bar()
-        if width <= 0:
-            self.canvas.itemconfigure(self._bar, state="hidden")
-            self.canvas.itemconfigure(self._shine, state="hidden")
-            return
-        effective = max(0.0, min(width, self._width - 4))
-        r = min(self._radius, effective / 2.0)
-        points = self._rounded_points(2, 2, 2 + effective, self._height - 2, r)
-        self.canvas.coords(self._bar, *points)
-        self.canvas.coords(self._shine, *points)
-        self.canvas.itemconfigure(self._bar, state="normal")
-        self.canvas.itemconfigure(self._shine, state="normal")
-
-    def set_value(self, value):
-        self._value = max(0.0, min(100.0, float(value)))
-        if self._width <= 0:
-            return
-        fill_width = (self._width - 4) * (self._value / 100.0)
-        self._set_bar_width(fill_width)
-
-    def reset(self):
-        self.set_value(0.0)
-
-    def _on_resize(self, event):
-        new_width = max(event.width, 20)
-        if abs(new_width - self._width) < 1:
-            return
-        self._width = new_width
-        self.canvas.config(width=new_width)
-        self._draw_trough()
-        self.set_value(self._value)
-
-
 def apply_theme(root, theme_key, info_text_widget=None):
     style = ttk.Style()
     try:
@@ -1277,14 +1173,12 @@ def start_copy(
     category,
     info_box,
     btn_start,
-    pb_main,
     status_lbl,
     pause_btn,
     cancel_btn,
     star_btn,
     star_refresh_cb,
     state,
-    progress_var=None,
     extract_star=False,
 ):
     if state.is_copying:
@@ -1384,9 +1278,12 @@ def start_copy(
     log_file = os.path.join(target_dir, "copy_log.txt")
     mmdd_str = f"{today.month:02d}{today.day:02d}"
 
-    pb_main.reset()
-    if progress_var is not None:
-        progress_var.set("进度：0.0%")
+    progress_start_fn = getattr(state, "progress_start", None)
+    progress_stop_fn = getattr(state, "progress_stop_done", None)
+    progress_reset_fn = getattr(state, "progress_cancel_reset", None)
+
+    if callable(progress_reset_fn):
+        progress_reset_fn()
     status_lbl.config(text="准备复制…")
 
     beep_start()
@@ -1411,6 +1308,9 @@ def start_copy(
             state.progress_queue.get_nowait()
         except queue.Empty:
             break
+
+    if callable(progress_start_fn):
+        progress_start_fn(total_size)
 
     def safe_log(message):
         root.after(0, lambda m=message: log_add(info_box, m))
@@ -1495,9 +1395,8 @@ def start_copy(
                     pass
 
             if cancelled:
-                pb_main.reset()
-                if progress_var is not None:
-                    progress_var.set("进度：0.0%")
+                if callable(progress_reset_fn):
+                    progress_reset_fn()
                 status_lbl.config(text="已取消")
                 log_add(info_box, "已取消并回滚")
                 if removed:
@@ -1506,9 +1405,8 @@ def start_copy(
                     for d in removed_dirs:
                         log_add(info_box, f"已删除目录：{d}")
             elif error is not None:
-                pb_main.reset()
-                if progress_var is not None:
-                    progress_var.set("进度：0.0%")
+                if callable(progress_reset_fn):
+                    progress_reset_fn()
                 status_lbl.config(text="复制失败")
                 log_add(info_box, f"复制失败：{error}")
                 if removed:
@@ -1518,9 +1416,8 @@ def start_copy(
                         log_add(info_box, f"已删除目录：{d}")
                 aurora_showwarning("复制失败", f"发生错误：{error}", parent=root)
             else:
-                pb_main.set_value(100)
-                if progress_var is not None:
-                    progress_var.set("进度：100.0%")
+                if callable(progress_stop_fn):
+                    progress_stop_fn()
                 status_lbl.config(text="复制完成")
                 log_add(info_box, f"复制完成 共 {len(created)} 个目标文件")
                 if manifest_path:
@@ -1737,6 +1634,12 @@ def main_ui():
         copied_bytes=0,
         progress_phase="待机",
         progress_speed=0.0,
+        anim_cur=0.0,
+        anim_tgt=0.0,
+        anim_running=False,
+        last_real_update=time.monotonic(),
+        last_sim_bump=time.monotonic(),
+        progress_value_var=None,
     )
 
     header = ttk.Frame(root, style="AuroraHeader.TFrame", padding=(32, 26))
@@ -1832,14 +1735,96 @@ def main_ui():
     card3.grid_columnconfigure(2, weight=1)
     card3.grid_columnconfigure(3, weight=0)
     card3.grid_columnconfigure(4, weight=0)
-    pb_main = AuroraProgressBar(card3)
+    progress_value_var = tk.DoubleVar(value=0.0)
+    pb_main = ttk.Progressbar(
+        card3,
+        mode="determinate",
+        maximum=100,
+        variable=progress_value_var,
+        style="Aurora.Horizontal.TProgressbar",
+    )
     pb_main.grid(row=0, column=0, columnspan=4, sticky="ew")
-    progress_pct_var = tk.StringVar(value="进度：0.0%")
+    progress_pct_var = tk.StringVar(value="进度: 0.0%")
     ttk.Label(card3, textvariable=progress_pct_var, style="AuroraStatus.TLabel").grid(
         row=0, column=4, sticky="e", padx=(16, 0)
     )
     status_lbl = ttk.Label(card3, text="待机", style="AuroraStatus.TLabel")
     status_lbl.grid(row=1, column=0, columnspan=5, sticky="w", pady=(12, 0))
+
+    state.progress_value_var = progress_value_var
+    state.progress_pct_var = progress_pct_var
+
+    def progress_start(total_bytes):
+        state.anim_cur = 0.0
+        state.anim_tgt = 0.0
+        state.anim_running = True
+        state.total_bytes = total_bytes
+        state.copied_bytes = 0
+        now = time.monotonic()
+        state.last_real_update = now
+        state.last_sim_bump = now
+        progress_value_var.set(0.0)
+        progress_pct_var.set("进度: 0.0%")
+
+    def progress_set_real(copied, total):
+        if not state.anim_running:
+            return
+        now = time.monotonic()
+        if total > 0 and copied >= total:
+            state.last_real_update = now
+            progress_stop_done()
+            return
+        if total > 0:
+            percent = max(0.0, min(100.0, (copied / total) * 100.0))
+            target = min(99.0, percent)
+        else:
+            target = min(99.0, state.anim_tgt + 0.5)
+        state.anim_tgt = max(0.0, target)
+        state.last_real_update = now
+
+    def progress_bump_sim(pace=0.3, cap=99.0):
+        if not state.anim_running:
+            return
+        if state.anim_tgt >= cap:
+            return
+        state.anim_tgt = min(cap, state.anim_tgt + pace)
+        state.last_sim_bump = time.monotonic()
+
+    def progress_stop_done():
+        state.anim_running = True
+        state.anim_tgt = 100.0
+        state.last_real_update = time.monotonic()
+
+    def progress_cancel_reset():
+        state.anim_running = False
+        state.anim_tgt = 0.0
+        state.anim_cur = 0.0
+        state.total_bytes = 0
+        state.copied_bytes = 0
+        progress_value_var.set(0.0)
+        progress_pct_var.set("进度: 0.0%")
+        state.last_real_update = time.monotonic()
+        state.last_sim_bump = state.last_real_update
+
+    def progress_tick():
+        target = state.anim_tgt
+        current = state.anim_cur
+        if abs(target - current) > 0.01:
+            step = max(0.2, abs(target - current) * 0.25)
+            if current < target:
+                current = min(current + step, target)
+            else:
+                current = max(current - step, target)
+            state.anim_cur = current
+        else:
+            state.anim_cur = target
+        progress_value_var.set(state.anim_cur)
+        progress_pct_var.set(f"进度: {state.anim_cur:.1f}%")
+        root.after(50, progress_tick)
+
+    state.progress_start = progress_start
+    state.progress_stop_done = progress_stop_done
+    state.progress_cancel_reset = progress_cancel_reset
 
     def pump_progress():
         drained = 0
@@ -1847,6 +1832,7 @@ def main_ui():
         last_speed = None
         last_done = None
         last_total = None
+        had_real_update = False
         try:
             while True:
                 item = state.progress_queue.get_nowait()
@@ -1863,23 +1849,33 @@ def main_ui():
         except queue.Empty:
             pass
 
-        if drained or last_done is not None:
-            if last_total is not None:
-                state.total_bytes = last_total
-            if last_done is not None:
-                state.copied_bytes = last_done
-            else:
-                state.copied_bytes = max(0, state.copied_bytes + drained)
-            if last_phase is not None:
-                state.progress_phase = last_phase
-            if last_speed is not None:
-                state.progress_speed = last_speed
+        if last_total is not None:
+            state.total_bytes = last_total
+        if last_phase is not None:
+            state.progress_phase = last_phase
+        if last_speed is not None:
+            state.progress_speed = last_speed
 
+        if last_done is not None:
+            state.copied_bytes = last_done
+            had_real_update = True
+        elif drained:
+            state.copied_bytes = max(0, state.copied_bytes + drained)
+            had_real_update = True
+
+        if had_real_update:
+            progress_set_real(state.copied_bytes, state.total_bytes)
+
+        now = time.monotonic()
+        if state.anim_running and state.is_copying and not state.is_paused:
+            if had_real_update:
+                state.last_sim_bump = now
+            elif (now - state.last_real_update) > 0.4 and (now - state.last_sim_bump) > 0.4:
+                progress_bump_sim()
+
+        if state.is_copying:
             total = state.total_bytes
             done = min(state.copied_bytes, total) if total else state.copied_bytes
-            percent = 0.0 if not total else min(100.0, max(0.0, (done / total) * 100.0))
-            pb_main.set_value(percent)
-            progress_pct_var.set(f"进度：{percent:.1f}%")
             current_phase = state.progress_phase or "进度"
             status_lbl.config(
                 text=f"{current_phase} | {bytes_to_human(done)} / {bytes_to_human(total)} | 速度 {state.progress_speed:.2f} MB/s"
@@ -1887,6 +1883,7 @@ def main_ui():
 
         root.after(50, pump_progress)
 
+    progress_tick()
     pump_progress()
 
     def on_pause():
@@ -1971,14 +1968,12 @@ def main_ui():
             combo_cat.get().strip(),
             info_box,
             btn_start,
-            pb_main,
             status_lbl,
             pause_btn,
             cancel_btn,
             star_btn,
             refresh_star_button_visual,
             state,
-            progress_pct_var,
             extract_star=extract_star_flag,
         )
 
