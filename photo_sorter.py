@@ -1,4 +1,4 @@
-# 陈同学影像管理助手 v1.7.7
+# 陈同学影像管理助手 v1.7.8
 # 更新点：
 # - 开始/完成提示音
 # - 复制过程无弹窗；主界面显示进度与速度（MB/s）
@@ -9,15 +9,17 @@
 # - 星标提取按钮直接切换状态并记录日志，进度条实时刷新显示百分比，按钮风格保持一致
 # - 复制进度改为队列驱动刷新，彻底消除跨线程 UI 调用引发的卡顿
 # - 全新动画进度条：真实进度优先，缺失数据时模拟推进，确保界面流畅
+# - 进度条新增预计剩余时间显示，随平均速率实时更新
+# - 操作按钮样式统一并区分启用、禁用与暂停状态
 
-import os, sys, json, time, shutil, platform, subprocess, re, threading, queue
+import os, sys, json, time, shutil, platform, subprocess, re, threading, queue, math
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from datetime import datetime
 
 from types import SimpleNamespace
 
-VERSION = "v1.7.7"
+VERSION = "v1.7.8"
 CONFIG_FILE = "photo_sorter_config.json"
 CATEGORIES = ["婚礼", "写真", "日常记录", "旅游记录", "商业活动拍摄"]
 THEMES = ["暗黑"]
@@ -68,6 +70,25 @@ def bytes_to_human(n) -> str:
     while v >= 1024.0 and i < len(units) - 1:
         v /= 1024.0; i += 1
     return f"{v:.2f} {units[i]}"
+
+
+def format_eta(seconds: float) -> str:
+    if not math.isfinite(seconds) or seconds < 0:
+        return "剩余时间：计算中…"
+    seconds = max(seconds, 0.0)
+    if seconds < 1:
+        return "剩余约 0 秒"
+    if seconds < 60:
+        return f"剩余约 {int(seconds)} 秒"
+    if seconds < 3600:
+        minutes = math.ceil(seconds / 60.0)
+        return f"剩余约 {minutes} 分钟"
+    hours = seconds / 3600.0
+    if hours >= 10:
+        hours = math.ceil(hours)
+        return f"剩余约 {int(hours)} 小时"
+    return f"剩余约 {hours:.1f} 小时"
+
 
 def get_drive_type_code(letter):
     import ctypes
@@ -791,6 +812,32 @@ def apply_theme(root, theme_key, info_text_widget=None):
         style.map(name, **button_map)
 
     style.configure(
+        "AuroraDisabled.TButton",
+        background="#1C283D",
+        foreground="#5F7394",
+        font=_font(12, "bold"),
+        padding=(22, 10),
+        borderwidth=0,
+        focusthickness=0,
+    )
+    style.map("AuroraDisabled.TButton", background=[("active", "#1C283D"), ("pressed", "#1C283D")], foreground=[("active", "#5F7394")])
+
+    style.configure(
+        "AuroraWarning.TButton",
+        background="#F59E0B",
+        foreground="#0A0F1C",
+        font=_font(12, "bold"),
+        padding=(22, 10),
+        borderwidth=0,
+        focusthickness=0,
+    )
+    style.map(
+        "AuroraWarning.TButton",
+        background=[("active", "#FFB020"), ("pressed", "#C27803")],
+        foreground=[("active", "#0A0F1C"), ("pressed", "#020307")],
+    )
+
+    style.configure(
         "AuroraSuccess.TButton",
         background="#4CAF50",
         foreground="#F8FAFC",
@@ -803,6 +850,21 @@ def apply_theme(root, theme_key, info_text_widget=None):
         "AuroraSuccess.TButton",
         background=[("active", "#67C566"), ("pressed", "#2F7C31")],
         foreground=[("pressed", "#E8FCE8"), ("active", "#F8FFFA")],
+    )
+
+    style.configure(
+        "AuroraDanger.TButton",
+        background="#F87171",
+        foreground="#0F172A",
+        font=_font(12, "bold"),
+        padding=(22, 10),
+        borderwidth=0,
+        focusthickness=0,
+    )
+    style.map(
+        "AuroraDanger.TButton",
+        background=[("active", "#FB7185"), ("pressed", "#B91C1C")],
+        foreground=[("active", "#0F172A"), ("pressed", "#FDF2F2")],
     )
 
     style.configure("Aurora.Horizontal.TProgressbar", troughcolor=P["TROUGH"], bordercolor=P["TROUGH"], background=P["ACCENT"], darkcolor=P["ACCENT_ACTIVE"], lightcolor=P["ACCENT"], thickness=10)
@@ -858,6 +920,13 @@ def set_text_theme(widget, theme_key):
         padx=16,
         pady=14,
     )
+
+
+def set_button_state(button: ttk.Button, *, active: bool = True, style_active: str = "AuroraPrimary.TButton", style_disabled: str = "AuroraDisabled.TButton", cursor_active: str = "hand2") -> None:
+    if active:
+        button.config(state="normal", style=style_active, cursor=cursor_active)
+    else:
+        button.config(state="disabled", style=style_disabled, cursor="arrow")
 
 
 def _normalize_parent(widget):
@@ -1285,14 +1354,18 @@ def start_copy(
     if callable(progress_reset_fn):
         progress_reset_fn()
     status_lbl.config(text="准备复制…")
+    if state.progress_eta_var is not None:
+        state.progress_eta_var.set("剩余时间：计算中…")
+        state.last_eta_text = "剩余时间：计算中…"
 
     beep_start()
     log_add(info_box, "开始复制…")
 
-    btn_start.configure(state="disabled")
-    pause_btn.config(state="disabled", text="暂停")
-    cancel_btn.config(state="disabled")
-    star_btn.config(state="disabled")
+    set_button_state(btn_start, active=False)
+    set_button_state(pause_btn, active=False)
+    pause_btn.config(text="暂停")
+    set_button_state(cancel_btn, active=False, style_active="AuroraDanger.TButton")
+    set_button_state(star_btn, active=False)
 
     state.is_copying = True
     state.is_paused = False
@@ -1384,10 +1457,11 @@ def start_copy(
             state.progress_phase = "待机"
             state.progress_speed = 0.0
 
-            btn_start.configure(state="normal")
-            pause_btn.config(state="disabled", text="暂停")
-            cancel_btn.config(state="disabled")
-            star_btn.config(state="normal")
+            set_button_state(btn_start, active=True)
+            set_button_state(pause_btn, active=False)
+            pause_btn.config(text="暂停")
+            set_button_state(cancel_btn, active=False, style_active="AuroraDanger.TButton")
+            set_button_state(star_btn, active=True)
             if star_refresh_cb is not None:
                 try:
                     star_refresh_cb()
@@ -1399,6 +1473,9 @@ def start_copy(
                     progress_reset_fn()
                 status_lbl.config(text="已取消")
                 log_add(info_box, "已取消并回滚")
+                if state.progress_eta_var is not None:
+                    state.progress_eta_var.set("已取消")
+                    state.last_eta_text = "已取消"
                 if removed:
                     log_add(info_box, f"已清理 {removed} 个文件")
                 if removed_dirs:
@@ -1409,6 +1486,9 @@ def start_copy(
                     progress_reset_fn()
                 status_lbl.config(text="复制失败")
                 log_add(info_box, f"复制失败：{error}")
+                if state.progress_eta_var is not None:
+                    state.progress_eta_var.set("复制失败")
+                    state.last_eta_text = "复制失败"
                 if removed:
                     log_add(info_box, f"已清理 {removed} 个文件")
                 if removed_dirs:
@@ -1430,8 +1510,9 @@ def start_copy(
     worker_thread = threading.Thread(target=worker, daemon=True)
     worker_thread.start()
 
-    pause_btn.config(state="normal", text="暂停")
-    cancel_btn.config(state="normal")
+    set_button_state(pause_btn, active=True)
+    pause_btn.config(text="暂停")
+    set_button_state(cancel_btn, active=True, style_active="AuroraDanger.TButton")
 
 # ---------- CLI 模式 ----------
 def _prompt_directory(prompt, allow_create=False):
@@ -1640,6 +1721,10 @@ def main_ui():
         last_real_update=time.monotonic(),
         last_sim_bump=time.monotonic(),
         progress_value_var=None,
+        progress_pct_var=None,
+        progress_eta_var=None,
+        last_eta_text="剩余时间：--",
+        progress_start_time=0.0,
     )
 
     header = ttk.Frame(root, style="AuroraHeader.TFrame", padding=(32, 26))
@@ -1709,8 +1794,10 @@ def main_ui():
 
     def refresh_star_button_visual():
         suffix = "√" if extract_star_enabled else "×"
-        style_name = "AuroraSuccess.TButton" if extract_star_enabled else "AuroraPrimary.TButton"
-        star_btn.config(text=f"提取星标照片 {suffix}", style=style_name)
+        star_btn.config(text=f"提取星标照片 {suffix}")
+        if str(star_btn["state"]) == "normal":
+            style_name = "AuroraSuccess.TButton" if extract_star_enabled else "AuroraPrimary.TButton"
+            star_btn.config(style=style_name)
 
     def toggle_star():
         nonlocal extract_star_enabled
@@ -1726,6 +1813,7 @@ def main_ui():
     )
     star_btn.grid(row=3, column=2, sticky="w", padx=(18, 0), pady=(14, 0))
 
+    set_button_state(star_btn, active=True)
     refresh_star_button_visual()
 
     card3 = ttk.Frame(left_col, style="AuroraCard.TFrame", padding=(28, 24))
@@ -1735,6 +1823,7 @@ def main_ui():
     card3.grid_columnconfigure(2, weight=1)
     card3.grid_columnconfigure(3, weight=0)
     card3.grid_columnconfigure(4, weight=0)
+    card3.grid_columnconfigure(5, weight=0)
     progress_value_var = tk.DoubleVar(value=0.0)
     pb_main = ttk.Progressbar(
         card3,
@@ -1748,11 +1837,16 @@ def main_ui():
     ttk.Label(card3, textvariable=progress_pct_var, style="AuroraStatus.TLabel").grid(
         row=0, column=4, sticky="e", padx=(16, 0)
     )
+    eta_var = tk.StringVar(value="剩余时间：--")
+    ttk.Label(card3, textvariable=eta_var, style="AuroraStatus.TLabel").grid(
+        row=0, column=5, sticky="w", padx=(16, 0)
+    )
     status_lbl = ttk.Label(card3, text="待机", style="AuroraStatus.TLabel")
     status_lbl.grid(row=1, column=0, columnspan=5, sticky="w", pady=(12, 0))
 
     state.progress_value_var = progress_value_var
     state.progress_pct_var = progress_pct_var
+    state.progress_eta_var = eta_var
 
     def progress_start(total_bytes):
         state.anim_cur = 0.0
@@ -1763,8 +1857,12 @@ def main_ui():
         now = time.monotonic()
         state.last_real_update = now
         state.last_sim_bump = now
+        state.progress_start_time = now
         progress_value_var.set(0.0)
         progress_pct_var.set("进度: 0.0%")
+        state.last_eta_text = "剩余时间：计算中…"
+        if state.progress_eta_var is not None:
+            state.progress_eta_var.set("剩余时间：计算中…")
 
     def progress_set_real(copied, total):
         if not state.anim_running:
@@ -1794,6 +1892,9 @@ def main_ui():
         state.anim_running = True
         state.anim_tgt = 100.0
         state.last_real_update = time.monotonic()
+        if state.progress_eta_var is not None:
+            state.progress_eta_var.set("完成")
+            state.last_eta_text = "完成"
 
     def progress_cancel_reset():
         state.anim_running = False
@@ -1805,6 +1906,10 @@ def main_ui():
         progress_pct_var.set("进度: 0.0%")
         state.last_real_update = time.monotonic()
         state.last_sim_bump = state.last_real_update
+        state.progress_start_time = 0.0
+        state.last_eta_text = "剩余时间：--"
+        if state.progress_eta_var is not None:
+            state.progress_eta_var.set("剩余时间：--")
 
     def progress_tick():
         target = state.anim_tgt
@@ -1867,6 +1972,7 @@ def main_ui():
             progress_set_real(state.copied_bytes, state.total_bytes)
 
         now = time.monotonic()
+        eta_text = None
         if state.anim_running and state.is_copying and not state.is_paused:
             if had_real_update:
                 state.last_sim_bump = now
@@ -1880,6 +1986,30 @@ def main_ui():
             status_lbl.config(
                 text=f"{current_phase} | {bytes_to_human(done)} / {bytes_to_human(total)} | 速度 {state.progress_speed:.2f} MB/s"
             )
+            if state.is_paused:
+                eta_text = "已暂停"
+            elif state.cancel_ev.is_set():
+                eta_text = "取消中…"
+            else:
+                remaining = max(state.total_bytes - state.copied_bytes, 0)
+                elapsed = now - state.progress_start_time if state.progress_start_time else 0.0
+                if remaining <= 0:
+                    eta_text = "完成"
+                elif elapsed > 0 and state.copied_bytes > 0:
+                    avg_speed = state.copied_bytes / elapsed
+                    if last_speed is None and avg_speed > 0:
+                        state.progress_speed = avg_speed / (1024 * 1024)
+                    if avg_speed > 0:
+                        eta_text = format_eta(remaining / avg_speed)
+                    else:
+                        eta_text = "剩余时间：计算中…"
+                else:
+                    eta_text = "剩余时间：计算中…"
+
+        if eta_text is not None and state.progress_eta_var is not None:
+            if eta_text != state.last_eta_text:
+                state.progress_eta_var.set(eta_text)
+                state.last_eta_text = eta_text
 
         root.after(50, pump_progress)
 
@@ -1893,13 +2023,21 @@ def main_ui():
             state.pause_ev.set()
             state.is_paused = True
             pause_btn.config(text="继续")
+            set_button_state(pause_btn, active=True, style_active="AuroraWarning.TButton")
             status_lbl.config(text="已暂停")
+            if state.progress_eta_var is not None:
+                state.progress_eta_var.set("已暂停")
+                state.last_eta_text = "已暂停"
             log_add(info_box, "已暂停")
         else:
             state.pause_ev.clear()
             state.is_paused = False
             pause_btn.config(text="暂停")
+            set_button_state(pause_btn, active=True, style_active="AuroraPrimary.TButton")
             status_lbl.config(text="继续执行")
+            if state.progress_eta_var is not None:
+                state.progress_eta_var.set("剩余时间：计算中…")
+                state.last_eta_text = "剩余时间：计算中…"
             log_add(info_box, "继续执行")
 
     def on_cancel():
@@ -1911,10 +2049,13 @@ def main_ui():
             parent=root,
         ):
             return
-        cancel_btn.config(state="disabled")
-        pause_btn.config(state="disabled")
+        set_button_state(cancel_btn, active=False, style_active="AuroraDanger.TButton")
+        set_button_state(pause_btn, active=False)
         state.cancel_ev.set()
         status_lbl.config(text="取消中…")
+        if state.progress_eta_var is not None:
+            state.progress_eta_var.set("取消中…")
+            state.last_eta_text = "取消中…"
         log_add(info_box, "取消中…")
 
     def open_current_month():
@@ -1988,6 +2129,12 @@ def main_ui():
 
     cancel_btn = ttk.Button(card3, text="取消", style="AuroraPrimary.TButton", command=on_cancel, state="disabled")
     cancel_btn.grid(row=2, column=4, sticky="e", padx=(16, 0), pady=(18, 0))
+
+    set_button_state(btn_start, active=True)
+    set_button_state(open_btn, active=True)
+    set_button_state(pause_btn, active=False)
+    pause_btn.config(text="暂停")
+    set_button_state(cancel_btn, active=False, style_active="AuroraDanger.TButton")
 
     footer = ttk.Label(root, text="此软件完全免费，请勿倒卖！ by: 抖音@摄影师陈同学", style="AuroraFooter.TLabel", anchor="center")
     footer.grid(row=2, column=0, columnspan=2, pady=(0, 18))
