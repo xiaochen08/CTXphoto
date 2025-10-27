@@ -1,4 +1,4 @@
-# 陈同学影像管理助手 v1.7.5
+# 陈同学影像管理助手 v1.7.6
 # 更新点：
 # - 开始/完成提示音
 # - 复制过程无弹窗；主界面显示进度与速度（MB/s）
@@ -7,15 +7,16 @@
 # - 弹窗统一 Aurora 风格并适配暗黑主题
 # - 新增 Aurora 风格文本输入弹窗，统一拍摄名称输入体验
 # - 星标提取按钮直接切换状态并记录日志，进度条实时刷新显示百分比，按钮风格保持一致
+# - 复制进度改为队列驱动刷新，彻底消除跨线程 UI 调用引发的卡顿
 
-import os, sys, json, time, shutil, platform, subprocess, re, threading
+import os, sys, json, time, shutil, platform, subprocess, re, threading, queue
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from datetime import datetime
 
 from types import SimpleNamespace
 
-VERSION = "v1.7.5"
+VERSION = "v1.7.6"
 CONFIG_FILE = "photo_sorter_config.json"
 CATEGORIES = ["婚礼", "写真", "日常记录", "旅游记录", "商业活动拍摄"]
 THEMES = ["暗黑"]
@@ -556,25 +557,16 @@ def copy_with_progress_seq_and_video(
     t0 = time.time()
     last_emit = 0.0
 
-    def emit_progress(phase, *, force=False):
+    def report_progress(phase, delta, *, force=False):
         nonlocal last_emit
         now = time.time()
-        elapsed = max(time.time() - t0, 1e-6)
+        if not force and now - last_emit < 0.05:
+            return
+        elapsed = max(now - t0, 1e-6)
         speed_mb = bytes_done / elapsed / (1024 * 1024)
-        pct = (bytes_done / total_bytes * 100) if total_bytes else 0
-        if pb is not None:
-            pb["value"] = min(max(pct, 0), 100)
-        if status_label is not None:
-            status_label.config(
-                text=f"{phase} | {bytes_to_human(bytes_done)} / {bytes_to_human(total_bytes)} | 速度 {speed_mb:.2f} MB/s"
-            )
-            try:
-                status_label.update_idletasks()
-            except Exception:
-                pass
         if progress_hook is not None:
             try:
-                progress_hook(phase, bytes_done, total_bytes, speed_mb)
+                progress_hook(delta, phase, bytes_done, total_bytes, speed_mb)
             except Exception:
                 pass
         last_emit = now
@@ -602,7 +594,7 @@ def copy_with_progress_seq_and_video(
                     fdst.write(chunk)
                     copied += len(chunk)
                     bytes_done += len(chunk)
-                    emit_progress(phase)
+                    report_progress(phase, len(chunk))
             try:
                 shutil.copystat(src_path, dst_path)
             except Exception:
@@ -621,7 +613,7 @@ def copy_with_progress_seq_and_video(
             except Exception:
                 pass
             raise
-        emit_progress(phase, force=True)
+        report_progress(phase, 0, force=True)
         return copied
 
     # 照片复制与重命名
@@ -629,10 +621,11 @@ def copy_with_progress_seq_and_video(
         check_flow()
         if src in done:
             try:
-                bytes_done += os.path.getsize(src)
+                size = os.path.getsize(src)
+                bytes_done += size
             except Exception:
-                pass
-            emit_progress("照片")
+                size = 0
+            report_progress("照片", size, force=True)
             continue
         td = raw_dir if is_raw_ext(ext) else jpg_dir
         dst_path = unique_path(td, f"{base}.{ext}")
@@ -657,10 +650,11 @@ def copy_with_progress_seq_and_video(
         check_flow()
         if src in done:
             try:
-                bytes_done += os.path.getsize(src)
+                size = os.path.getsize(src)
+                bytes_done += size
             except Exception:
-                pass
-            emit_progress("视频")
+                size = 0
+            report_progress("视频", size, force=True)
             continue
         dst_path = unique_path(vid_dir, os.path.basename(src))
         try:
@@ -676,7 +670,7 @@ def copy_with_progress_seq_and_video(
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(f"错误: {src} | {e}\n")
 
-    emit_progress("收尾", force=True)
+    report_progress("收尾", 0, force=True)
 
     if extract_star:
         log("开始提取星标照片…")
@@ -1394,7 +1388,6 @@ def start_copy(
     if progress_var is not None:
         progress_var.set("进度：0.0%")
     status_lbl.config(text="准备复制…")
-    root.update_idletasks()
 
     beep_start()
     log_add(info_box, "开始复制…")
@@ -1409,27 +1402,21 @@ def start_copy(
     state.cancel_ev.clear()
     state.pause_ev.clear()
     state.copied_paths.clear()
+    state.total_bytes = total_size
+    state.copied_bytes = 0
+    state.progress_phase = "准备复制…"
+    state.progress_speed = 0.0
+    while True:
+        try:
+            state.progress_queue.get_nowait()
+        except queue.Empty:
+            break
 
     def safe_log(message):
         root.after(0, lambda m=message: log_add(info_box, m))
 
-    def progress_cb(phase, done_bytes, total, speed_mb):
-        def _update():
-            if not state.is_copying:
-                return
-            pct = (done_bytes / total * 100) if total else (100.0 if phase == "收尾" else 0.0)
-            pct = max(0.0, min(100.0, pct))
-            pb_main.set_value(pct)
-            if progress_var is not None:
-                progress_var.set(f"进度：{pct:.1f}%")
-            status_lbl.config(
-                text=f"{phase} | {bytes_to_human(done_bytes)} / {bytes_to_human(total)} | 速度 {speed_mb:.2f} MB/s"
-            )
-            try:
-                root.update_idletasks()
-            except Exception:
-                pass
-        root.after(0, _update)
+    def progress_cb(delta_bytes, phase, done_bytes, total, speed_mb):
+        state.progress_queue.put(("progress", delta_bytes, done_bytes, total, phase, speed_mb))
 
     def on_file_done(path):
         state.copied_paths.append(path)
@@ -1492,6 +1479,10 @@ def start_copy(
             state.pause_ev.clear()
             state.cancel_ev.clear()
             state.copied_paths.clear()
+            state.total_bytes = 0
+            state.copied_bytes = 0
+            state.progress_phase = "待机"
+            state.progress_speed = 0.0
 
             btn_start.configure(state="normal")
             pause_btn.config(state="disabled", text="暂停")
@@ -1664,7 +1655,7 @@ def run_cli(reason=None):
 
         last_emit = 0.0
 
-        def progress_hook(phase, done_bytes, total_bytes, speed_mb):
+        def progress_hook(delta_bytes, phase, done_bytes, total_bytes, speed_mb):
             nonlocal last_emit
             now = time.time()
             if now - last_emit < 0.5 and done_bytes < total_bytes:
@@ -1741,6 +1732,11 @@ def main_ui():
         is_copying=False,
         is_paused=False,
         copied_paths=[],
+        progress_queue=queue.Queue(),
+        total_bytes=0,
+        copied_bytes=0,
+        progress_phase="待机",
+        progress_speed=0.0,
     )
 
     header = ttk.Frame(root, style="AuroraHeader.TFrame", padding=(32, 26))
@@ -1844,6 +1840,54 @@ def main_ui():
     )
     status_lbl = ttk.Label(card3, text="待机", style="AuroraStatus.TLabel")
     status_lbl.grid(row=1, column=0, columnspan=5, sticky="w", pady=(12, 0))
+
+    def pump_progress():
+        drained = 0
+        last_phase = None
+        last_speed = None
+        last_done = None
+        last_total = None
+        try:
+            while True:
+                item = state.progress_queue.get_nowait()
+                if not isinstance(item, tuple) or not item:
+                    continue
+                kind = item[0]
+                if kind == "progress" and len(item) == 6:
+                    _, delta, done_bytes, total_bytes, phase, speed_mb = item
+                    drained += max(delta, 0)
+                    last_phase = phase
+                    last_speed = speed_mb
+                    last_done = max(done_bytes, 0)
+                    last_total = max(total_bytes, 0)
+        except queue.Empty:
+            pass
+
+        if drained or last_done is not None:
+            if last_total is not None:
+                state.total_bytes = last_total
+            if last_done is not None:
+                state.copied_bytes = last_done
+            else:
+                state.copied_bytes = max(0, state.copied_bytes + drained)
+            if last_phase is not None:
+                state.progress_phase = last_phase
+            if last_speed is not None:
+                state.progress_speed = last_speed
+
+            total = state.total_bytes
+            done = min(state.copied_bytes, total) if total else state.copied_bytes
+            percent = 0.0 if not total else min(100.0, max(0.0, (done / total) * 100.0))
+            pb_main.set_value(percent)
+            progress_pct_var.set(f"进度：{percent:.1f}%")
+            current_phase = state.progress_phase or "进度"
+            status_lbl.config(
+                text=f"{current_phase} | {bytes_to_human(done)} / {bytes_to_human(total)} | 速度 {state.progress_speed:.2f} MB/s"
+            )
+
+        root.after(50, pump_progress)
+
+    pump_progress()
 
     def on_pause():
         if not state.is_copying:
