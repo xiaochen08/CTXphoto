@@ -2118,7 +2118,7 @@ def main_ui():
             extract_star=extract_star_flag,
         )
 
-    btn_start = ttk.Button(card3, text="开始分类", style="AuroraPrimary.TButton", command=start_action)
+    btn_start = ttk.Button(card3, text="开始", style="AuroraPrimary.TButton", command=start_action)
     btn_start.grid(row=2, column=0, sticky="w", pady=(18, 0))
 
     open_btn = ttk.Button(card3, text="打开文件夹", style="AuroraPrimary.TButton", command=open_current_month)
