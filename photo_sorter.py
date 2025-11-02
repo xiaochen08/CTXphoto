@@ -1,4 +1,4 @@
-# 陈同学影像管理助手 v1.7.8
+# 陈同学影像管理助手 v1.7.9
 # 更新点：
 # - 开始/完成提示音
 # - 复制过程无弹窗；主界面显示进度与速度（MB/s）
@@ -11,21 +11,44 @@
 # - 全新动画进度条：真实进度优先，缺失数据时模拟推进，确保界面流畅
 # - 进度条新增预计剩余时间显示，随平均速率实时更新
 # - 操作按钮样式统一并区分启用、禁用与暂停状态
+# - 新增闭眼/半眨/翻白眼与曝光检测流程，支持红框预览与批量删除记录
 
-import os, sys, json, time, shutil, platform, subprocess, re, threading, queue, math
+import os, sys, json, time, shutil, platform, subprocess, re, threading, queue, math, csv, io
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from datetime import datetime
 
 from types import SimpleNamespace
 
-VERSION = "v1.7.8"
+VERSION = "v1.7.9"
 CONFIG_FILE = "photo_sorter_config.json"
 CATEGORIES = ["婚礼", "写真", "日常记录", "旅游记录", "商业活动拍摄"]
 THEMES = ["暗黑"]
 DEFAULT_THEME_KEY = "dark"
 LOG_PANEL_WIDTH = 360
 COPY_BUFFER_SIZE = 4 * 1024 * 1024
+
+DEFAULT_CONFIG = {
+    "last_target_root": "",
+    "theme": DEFAULT_THEME_KEY,
+    "sash_ratio": 0.55,
+    "eye": {
+        "ear_closed": 0.20,
+        "ear_half": 0.26,
+        "roll_margin": 0.18,
+        "conf_min": 0.5,
+    },
+    "exposure": {
+        "under_dark_pct": 0.45,
+        "under_p75": 60,
+        "over_bright_pct": 0.10,
+        "over_p99": 254,
+    },
+    "scan": {
+        "ext": [".jpg", ".jpeg"],
+        "max_side": 1600,
+    },
+}
 
 SUPPRESS_RUNTIME_WARNINGS = any(arg in ("-h", "--help") for arg in sys.argv[1:])
 
@@ -37,9 +60,10 @@ except Exception:  # pragma: no cover - best effort fallback for limited environ
         print("[警告] 未检测到 psutil，部分磁盘信息功能将受限。", file=sys.stderr)
 
 try:
-    from PIL import Image, ExifTags
+    from PIL import Image, ExifTags, ImageTk
 except Exception:  # pragma: no cover - optional dependency fallback
     Image = None
+    ImageTk = None
     ExifTags = SimpleNamespace(TAGS={})
     if not SUPPRESS_RUNTIME_WARNINGS:
         print("[警告] 未检测到 Pillow，EXIF 读取功能将受限。", file=sys.stderr)
@@ -58,6 +82,34 @@ try:
 except Exception:
     def beep_start(): pass
     def beep_done():  pass
+
+try:
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    cv2 = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 opencv-python，闭眼/曝光检测功能将不可用。", file=sys.stderr)
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    np = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 numpy，闭眼/曝光检测功能将不可用。", file=sys.stderr)
+
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    mp = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 mediapipe，闭眼/曝光检测功能将不可用。", file=sys.stderr)
+
+try:
+    from send2trash import send2trash  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    send2trash = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 send2trash，检测模式将无法安全删除文件。", file=sys.stderr)
 
 # ---------- 工具 ----------
 def ts(): return datetime.now().strftime("%H:%M:%S")
@@ -171,6 +223,35 @@ def get_drive_label(letter):
     if not name and get_drive_type_code(letter)==2: return "U盘"
     return name or "(无名称)"
 
+def is_removable_path(path: str) -> bool:
+    try:
+        abs_path = os.path.abspath(path)
+    except Exception:
+        return False
+    if os.name == "nt":
+        drive = os.path.splitdrive(abs_path)[0]
+        if len(drive) == 2 and drive.endswith(":"):
+            return get_drive_type_code(drive) == 2
+        return False
+    if psutil is None:
+        return False
+    try:
+        for part in psutil.disk_partitions(all=False):
+            mount = getattr(part, "mountpoint", "")
+            if not mount:
+                continue
+            try:
+                if abs_path.startswith(mount):
+                    opts = getattr(part, "opts", "") or ""
+                    if "removable" in opts or "thumb" in opts:
+                        return True
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
 def get_drive_usage_bytes(root):
     path = root
     if os.name == "nt":
@@ -188,17 +269,22 @@ def get_drive_usage_bytes(root):
     return total, free
 
 def load_config():
+    cfg = DEFAULT_CONFIG.copy()
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE,"r",encoding="utf-8") as f:
-            cfg = json.load(f)
-            theme = cfg.get("theme", DEFAULT_THEME_KEY)
-            if theme not in {DEFAULT_THEME_KEY}:
-                cfg["theme"] = DEFAULT_THEME_KEY
-            if "theme" not in cfg:
-                cfg["theme"] = DEFAULT_THEME_KEY
-            if "sash_ratio" not in cfg: cfg["sash_ratio"] = 0.55
-            return cfg
-    return {"last_target_root": "", "theme": DEFAULT_THEME_KEY, "sash_ratio": 0.55}
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        if isinstance(data, dict):
+            cfg.update({k: v for k, v in data.items() if k not in {"eye", "exposure", "scan"}})
+            for key in ("eye", "exposure", "scan"):
+                section = DEFAULT_CONFIG[key].copy()
+                user_section = data.get(key)
+                if isinstance(user_section, dict):
+                    section.update(user_section)
+                cfg[key] = section
+    return cfg
 
 def save_config(cfg):
     with open(CONFIG_FILE,"w",encoding="utf-8") as f: json.dump(cfg,f,ensure_ascii=False,indent=2)
@@ -403,6 +489,671 @@ def remove_daily_folder_tree(target_dir, copy_date):
     except Exception:
         pass
     return removed
+
+# ---------- 检测工作流 ----------
+class DetectionSession(SimpleNamespace):
+    """保存检测过程中的临时状态。"""
+
+
+CURRENT_DETECTION_SESSION: DetectionSession | None = None
+
+
+def _ensure_detection_ready():
+    if cv2 is None or np is None or mp is None:
+        raise RuntimeError("检测功能依赖 opencv-python、numpy 与 mediapipe，请先安装依赖。")
+    if send2trash is None:
+        raise RuntimeError("检测功能依赖 send2trash 以安全删除文件，请先安装依赖。")
+
+
+def scan_jpgs(root_dir) -> list[str]:
+    cfg = load_config()
+    exts = {ext.lower() for ext in cfg.get("scan", {}).get("ext", [".jpg", ".jpeg"])}
+    matches: list[str] = []
+    for base, _dirs, files in os.walk(root_dir):
+        for name in files:
+            ext = os.path.splitext(name)[1].lower()
+            if ext in exts:
+                matches.append(os.path.join(base, name))
+    matches.sort()
+    return matches
+
+
+FACE_MESH_OBJ = None
+
+
+def _get_face_mesh():
+    global FACE_MESH_OBJ
+    if FACE_MESH_OBJ is None and mp is not None:
+        FACE_MESH_OBJ = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=True,
+            refine_landmarks=True,
+            max_num_faces=1,
+            min_detection_confidence=0.5,
+        )
+    return FACE_MESH_OBJ
+
+
+_EYE_LANDMARKS_L = [33, 160, 158, 133, 153, 144]
+_EYE_LANDMARKS_R = [362, 385, 387, 263, 373, 380]
+_IRIS_L = [468, 469, 470, 471, 472]
+_IRIS_R = [473, 474, 475, 476, 477]
+
+
+def _ear_from_landmarks(pts: 'np.ndarray') -> float:
+    a = float(np.linalg.norm(pts[1] - pts[5]))
+    b = float(np.linalg.norm(pts[2] - pts[4]))
+    c = float(np.linalg.norm(pts[0] - pts[3]))
+    if c <= 1e-6:
+        return 0.0
+    return (a + b) / (2.0 * c)
+
+
+def _iris_position(iris_pts: 'np.ndarray', eye_box) -> tuple[float, float]:
+    if iris_pts.size == 0 or not eye_box:
+        return (0.5, 0.5)
+    cx = float(np.mean(iris_pts[:, 0]))
+    cy = float(np.mean(iris_pts[:, 1]))
+    x0, y0, w, h = eye_box
+    if w <= 0 or h <= 0:
+        return (0.5, 0.5)
+    return ((cx - x0) / w, (cy - y0) / h)
+
+
+def detect_eye_state(img_bgr) -> dict:
+    if cv2 is None or np is None or mp is None:
+        return {
+            "state": "unknown",
+            "left_eye_box": None,
+            "right_eye_box": None,
+            "ear_L": 0.0,
+            "ear_R": 0.0,
+            "confidence": 0.0,
+        }
+
+    mesh = _get_face_mesh()
+    if mesh is None:
+        return {
+            "state": "unknown",
+            "left_eye_box": None,
+            "right_eye_box": None,
+            "ear_L": 0.0,
+            "ear_R": 0.0,
+            "confidence": 0.0,
+        }
+
+    h, w = img_bgr.shape[:2]
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    result = mesh.process(rgb)
+    if not result.multi_face_landmarks:
+        return {
+            "state": "unknown",
+            "left_eye_box": None,
+            "right_eye_box": None,
+            "ear_L": 0.0,
+            "ear_R": 0.0,
+            "confidence": 0.0,
+        }
+
+    face = result.multi_face_landmarks[0]
+    pts = np.array([(lm.x * w, lm.y * h) for lm in face.landmark], dtype=np.float32)
+
+    left = pts[_EYE_LANDMARKS_L]
+    right = pts[_EYE_LANDMARKS_R]
+
+    lbox = (
+        float(np.min(left[:, 0])),
+        float(np.min(left[:, 1])),
+        float(np.max(left[:, 0]) - np.min(left[:, 0])),
+        float(np.max(left[:, 1]) - np.min(left[:, 1])),
+    )
+    rbox = (
+        float(np.min(right[:, 0])),
+        float(np.min(right[:, 1])),
+        float(np.max(right[:, 0]) - np.min(right[:, 0])),
+        float(np.max(right[:, 1]) - np.min(right[:, 1])),
+    )
+
+    ear_L = float(_ear_from_landmarks(left))
+    ear_R = float(_ear_from_landmarks(right))
+
+    iris_L = pts[_IRIS_L]
+    iris_R = pts[_IRIS_R]
+    iris_pos_L = _iris_position(iris_L, lbox)
+    iris_pos_R = _iris_position(iris_R, rbox)
+
+    cfg = load_config()
+    eye_cfg = cfg.get("eye", {})
+    closed_th = float(eye_cfg.get("ear_closed", 0.20))
+    half_th = float(eye_cfg.get("ear_half", 0.26))
+    roll_margin = float(eye_cfg.get("roll_margin", 0.18))
+
+    avg_ear = (ear_L + ear_R) / 2.0
+    state = "ok"
+    if avg_ear < closed_th:
+        state = "closed"
+    elif avg_ear < half_th:
+        state = "half"
+
+    for iris_pos in (iris_pos_L, iris_pos_R):
+        if iris_pos[1] < roll_margin or iris_pos[1] > 1.0 - roll_margin:
+            state = "roll"
+            break
+
+    return {
+        "state": state,
+        "left_eye_box": lbox,
+        "right_eye_box": rbox,
+        "ear_L": ear_L,
+        "ear_R": ear_R,
+        "confidence": 1.0,
+        "iris_L": iris_pos_L,
+        "iris_R": iris_pos_R,
+    }
+
+
+def assess_exposure(img_bgr) -> dict:
+    if np is None:
+        return {"under": False, "over": False, "metrics": {}}
+
+    cfg = load_config()
+    expo_cfg = cfg.get("exposure", {})
+    if cv2 is not None:
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = (img_bgr[..., 2] * 0.299 + img_bgr[..., 1] * 0.587 + img_bgr[..., 0] * 0.114).astype(np.float32)
+    flat = gray.reshape(-1).astype(np.float32)
+    total = max(float(flat.size), 1.0)
+    dark_pct = float(np.sum(flat < 20.0) / total)
+    bright_pct = float(np.sum(flat > 240.0) / total)
+    p75 = float(np.percentile(flat, 75))
+    p99 = float(np.percentile(flat, 99))
+
+    under = dark_pct >= float(expo_cfg.get("under_dark_pct", 0.45)) or p75 < float(expo_cfg.get("under_p75", 60))
+    over = bright_pct >= float(expo_cfg.get("over_bright_pct", 0.10)) or p99 >= float(expo_cfg.get("over_p99", 254))
+
+    return {
+        "under": bool(under),
+        "over": bool(over),
+        "metrics": {
+            "dark_pct": dark_pct,
+            "bright_pct": bright_pct,
+            "p75": p75,
+            "p99": p99,
+        },
+    }
+
+
+def render_eye_boxes(img_bgr, boxes, labels) -> 'np.ndarray':
+    if cv2 is None:
+        return img_bgr
+    annotated = img_bgr.copy()
+    for box, label in zip(boxes, labels):
+        if not box:
+            continue
+        x, y, w, h = box
+        start = (int(x), int(y))
+        end = (int(x + w), int(y + h))
+        cv2.rectangle(annotated, start, end, (0, 0, 255), 2)
+        if label:
+            cv2.putText(annotated, label, (int(x), int(y) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1, cv2.LINE_AA)
+    return annotated
+
+
+def process_batch(paths, q_progress):  # 后台线程
+    session = CURRENT_DETECTION_SESSION
+    if session is None:
+        raise RuntimeError("检测会话尚未初始化。")
+
+    cfg = load_config()
+    max_side = int(cfg.get("scan", {}).get("max_side", 1600))
+    total_bytes = sum(max(os.path.getsize(p), 0) for p in paths if os.path.isfile(p))
+    session.total_bytes = total_bytes
+    session.start_time = time.time()
+    session.delete_records = []
+
+    q_progress.put(("total", total_bytes))
+
+    for path in paths:
+        if session.cancel_ev.is_set():
+            break
+        while session.pause_ev.is_set():
+            time.sleep(0.1)
+
+        try:
+            file_size = os.path.getsize(path)
+        except Exception:
+            file_size = 0
+
+        try:
+            data = np.fromfile(path, dtype=np.uint8)
+            img = cv2.imdecode(data, cv2.IMREAD_COLOR) if cv2 is not None else None
+        except Exception:
+            img = None
+
+        if img is None:
+            q_progress.put(("file", {"path": path, "error": "无法读取"}))
+            q_progress.put(("bytes", file_size))
+            continue
+
+        h, w = img.shape[:2]
+        if max(h, w) > max_side and max_side > 0:
+            scale = max_side / max(h, w)
+            img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+        eye_info = detect_eye_state(img)
+        expo_info = assess_exposure(img)
+
+        boxes = [eye_info.get("left_eye_box"), eye_info.get("right_eye_box")]
+        state = eye_info.get("state", "unknown")
+        if state == "closed":
+            labels = ["闭眼", "闭眼"]
+        elif state == "half":
+            labels = ["半眨", "半眨"]
+        elif state == "roll":
+            labels = ["翻白眼", "翻白眼"]
+        else:
+            labels = ["", ""]
+
+        annotated = render_eye_boxes(img, boxes, labels)
+        thumb = annotated
+        if max(thumb.shape[:2]) > 480:
+            ratio = 480 / max(thumb.shape[:2])
+            thumb = cv2.resize(thumb, (int(thumb.shape[1] * ratio), int(thumb.shape[0] * ratio)), interpolation=cv2.INTER_AREA)
+
+        thumb_bytes = None
+        if cv2 is not None:
+            ok, buf = cv2.imencode(".jpg", thumb)
+            if ok:
+                thumb_bytes = bytes(buf)
+
+        q_progress.put(
+            (
+                "file",
+                {
+                    "path": path,
+                    "eye": eye_info,
+                    "expo": expo_info,
+                    "thumb": thumb_bytes,
+                },
+            )
+        )
+
+        if state == "closed":
+            if getattr(session, "delete_all_closed", False):
+                decision = "yes"
+            else:
+                prompt_q = queue.Queue()
+                q_progress.put(("prompt", {"path": path, "eye": eye_info, "thumb": thumb_bytes, "response": prompt_q}))
+                try:
+                    decision = prompt_q.get()
+                except Exception:
+                    decision = "no"
+            if decision in ("yes", "all"):
+                try:
+                    send2trash(path)
+                    session.delete_records.append(
+                        {
+                            "time": datetime.now().isoformat(timespec="seconds"),
+                            "path": path,
+                            "reason": "闭眼",
+                        }
+                    )
+                    q_progress.put(("deleted", {"path": path}))
+                except Exception as exc:
+                    q_progress.put(("error", {"path": path, "error": str(exc)}))
+            if decision == "all":
+                session.delete_all_closed = True
+
+        q_progress.put(("bytes", file_size))
+
+    q_progress.put(("done", {"records": getattr(session, "delete_records", [])}))
+
+
+def on_detect_result(item):  # 主线程
+    session = CURRENT_DETECTION_SESSION
+    if session is None:
+        return
+    results = getattr(session, "results", None)
+    if results is None:
+        session.results = [item]
+    else:
+        results.append(item)
+
+
+def launch_eye_detection(root, info_box):
+    global CURRENT_DETECTION_SESSION
+    try:
+        _ensure_detection_ready()
+    except RuntimeError as exc:
+        aurora_showwarning("无法启动检测", str(exc), parent=root)
+        return
+
+    if CURRENT_DETECTION_SESSION is not None and not getattr(CURRENT_DETECTION_SESSION, "finished", False):
+        aurora_showwarning("检测进行中", "已有检测任务运行中，请先完成或取消后再启动新检测。", parent=root)
+        return
+
+    folder = filedialog.askdirectory(title="选择待检测文件夹（仅限固定硬盘）")
+    if not folder:
+        return
+
+    if is_removable_path(folder):
+        aurora_showwarning("路径受限", "仅支持固定硬盘/SSD 目录，检测已取消。", parent=root)
+        return
+
+    paths = scan_jpgs(folder)
+    if not paths:
+        aurora_showwarning("未找到 JPG", "所选目录未检测到 JPG/JPEG 文件。", parent=root)
+        return
+
+    log_add(info_box, f"检测目录：{folder}")
+    log_add(info_box, f"待检测文件数：{len(paths)}")
+
+    session = DetectionSession()
+    session.root_dir = folder
+    session.pause_ev = threading.Event()
+    session.cancel_ev = threading.Event()
+    session.queue = queue.Queue()
+    session.results = []
+    session.delete_all_closed = False
+    session.total_bytes = 0
+    session.copied_bytes = 0
+    session.start_time = time.time()
+    session.finished = False
+    session.photo_cache = {}
+    session.data_map = {}
+    session.was_cancelled = False
+    session.progress_var = tk.DoubleVar(value=0.0)
+    session.percent_var = tk.StringVar(value="进度: 0.0%")
+    session.eta_var = tk.StringVar(value="剩余时间：计算中…")
+    session.status_var = tk.StringVar(value="待机")
+
+    CURRENT_DETECTION_SESSION = session
+
+    win = tk.Toplevel(root)
+    session.window = win
+    win.title("闭眼与曝光检测")
+    win.minsize(960, 600)
+    win.geometry("1180x720")
+    win.transient(root)
+    apply_theme(win, load_config().get("theme", DEFAULT_THEME_KEY))
+
+    container = ttk.Frame(win, style="AuroraPanel.TFrame", padding=(24, 22))
+    container.pack(fill="both", expand=True)
+    container.grid_columnconfigure(0, weight=3)
+    container.grid_columnconfigure(1, weight=2)
+    container.grid_rowconfigure(1, weight=1)
+
+    header = ttk.Frame(container, style="AuroraCard.TFrame", padding=(22, 18))
+    header.grid(row=0, column=0, columnspan=2, sticky="ew")
+    ttk.Label(header, text=f"检测目录：{folder}", style="AuroraBody.TLabel", anchor="w").pack(anchor="w")
+    ttk.Label(header, textvariable=session.status_var, style="AuroraStatus.TLabel", anchor="w").pack(anchor="w", pady=(6, 0))
+
+    left = ttk.Frame(container, style="AuroraCard.TFrame", padding=(22, 20))
+    left.grid(row=1, column=0, sticky="nsew", padx=(0, 16))
+    left.grid_rowconfigure(2, weight=1)
+    left.grid_columnconfigure(0, weight=1)
+
+    pb = ttk.Progressbar(
+        left,
+        mode="determinate",
+        maximum=100,
+        variable=session.progress_var,
+        style="Aurora.Horizontal.TProgressbar",
+    )
+    pb.grid(row=0, column=0, columnspan=3, sticky="ew")
+
+    ttk.Label(left, textvariable=session.percent_var, style="AuroraStatus.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
+    ttk.Label(left, textvariable=session.eta_var, style="AuroraStatus.TLabel").grid(row=1, column=1, sticky="w", pady=(8, 0))
+
+    btn_frame = ttk.Frame(left, style="AuroraCard.TFrame")
+    btn_frame.grid(row=1, column=2, sticky="e", pady=(8, 0))
+
+    pause_btn = ttk.Button(btn_frame, text="暂停", style="AuroraPrimary.TButton", state="disabled")
+    pause_btn.grid(row=0, column=0, padx=(0, 12))
+    cancel_btn = ttk.Button(btn_frame, text="取消", style="AuroraDanger.TButton", state="disabled")
+    cancel_btn.grid(row=0, column=1)
+
+    columns = ("name", "eye", "expo")
+    tree = ttk.Treeview(left, columns=columns, show="headings", height=18, selectmode="browse")
+    tree.heading("name", text="文件")
+    tree.heading("eye", text="眼部状态")
+    tree.heading("expo", text="曝光")
+    tree.column("name", anchor="w", width=320)
+    tree.column("eye", anchor="center", width=110)
+    tree.column("expo", anchor="center", width=150)
+    tree.grid(row=2, column=0, columnspan=3, sticky="nsew", pady=(18, 0))
+    tree_scroll = ttk.Scrollbar(left, orient="vertical", command=tree.yview, style="Aurora.Vertical.TScrollbar")
+    tree_scroll.grid(row=2, column=3, sticky="nsw", pady=(18, 0), padx=(12, 0))
+    tree.configure(yscrollcommand=tree_scroll.set)
+
+    right = ttk.Frame(container, style="AuroraCard.TFrame", padding=(22, 20))
+    right.grid(row=1, column=1, sticky="nsew")
+    right.grid_rowconfigure(0, weight=1)
+    right.grid_columnconfigure(0, weight=1)
+    preview_label = ttk.Label(right, text="选择左侧结果查看预览", style="AuroraStatus.TLabel", anchor="center")
+    preview_label.grid(row=0, column=0, sticky="nsew")
+
+    session.tree = tree
+    session.preview_label = preview_label
+    session.pause_btn = pause_btn
+    session.cancel_btn = cancel_btn
+
+    def update_preview(path):
+        data = session.data_map.get(path)
+        if not data:
+            return
+        thumb_bytes = data.get("thumb")
+        if thumb_bytes is None or Image is None or ImageTk is None:
+            preview_label.configure(text=os.path.basename(path), image="")
+            preview_label.image = None
+            return
+        if path not in session.photo_cache:
+            try:
+                with Image.open(io.BytesIO(thumb_bytes)) as img:
+                    session.photo_cache[path] = ImageTk.PhotoImage(img)
+            except Exception:
+                session.photo_cache[path] = None
+        tk_img = session.photo_cache.get(path)
+        if tk_img is not None:
+            preview_label.configure(image=tk_img, text="")
+            preview_label.image = tk_img
+        else:
+            preview_label.configure(text=os.path.basename(path), image="")
+            preview_label.image = None
+
+    def on_select(_event=None):
+        sel = tree.selection()
+        if not sel:
+            return
+        path = tree.set(sel[0], "name")
+        stored_path = session.item_to_path.get(sel[0])
+        update_preview(stored_path or path)
+
+    tree.bind("<<TreeviewSelect>>", on_select)
+
+    session.item_to_path = {}
+
+    def update_progress(delta):
+        session.copied_bytes = min(session.total_bytes, session.copied_bytes + max(delta, 0))
+        if session.total_bytes > 0:
+            percent = min(100.0, (session.copied_bytes / session.total_bytes) * 100.0)
+        else:
+            percent = 0.0
+        session.progress_var.set(percent)
+        session.percent_var.set(f"进度: {percent:.1f}%")
+        elapsed = max(time.time() - session.start_time, 1e-6)
+        if session.copied_bytes <= 0 or session.total_bytes <= 0:
+            eta_text = "剩余时间：计算中…"
+        else:
+            remaining = (session.total_bytes - session.copied_bytes) / max(session.copied_bytes / elapsed, 1e-6)
+            eta_text = format_eta(remaining)
+        if session.pause_ev.is_set():
+            eta_text = "已暂停"
+        if session.cancel_ev.is_set():
+            eta_text = "取消中…"
+        session.eta_var.set(eta_text)
+
+    def refresh_status():
+        session.status_var.set(f"已检测 {len(session.results)} 张")
+
+    def handle_file(payload):
+        path = payload.get("path")
+        if not path:
+            return
+        on_detect_result(payload)
+        session.data_map[path] = payload
+        rel_name = os.path.relpath(path, session.root_dir)
+        eye = payload.get("eye", {})
+        expo = payload.get("expo", {})
+        state = eye.get("state", "unknown")
+        state_map = {
+            "closed": "闭眼",
+            "half": "半眨眼",
+            "roll": "翻白眼",
+            "ok": "正常",
+            "unknown": "不可判定",
+        }
+        expo_text = []
+        if expo.get("under"):
+            expo_text.append("欠曝")
+        if expo.get("over"):
+            expo_text.append("过曝")
+        expo_str = ",".join(expo_text) if expo_text else "正常"
+        iid = tree.insert("", "end", values=(rel_name, state_map.get(state, state), expo_str))
+        session.item_to_path[iid] = path
+        if len(session.results) == 1:
+            tree.selection_set(iid)
+            tree.focus(iid)
+            update_preview(path)
+        refresh_status()
+
+    def handle_prompt(payload):
+        if session.delete_all_closed:
+            payload.get("response").put("yes")
+            return
+        decision = aurora_ask_eye_delete(parent=win)
+        if decision == "all":
+            session.delete_all_closed = True
+            payload.get("response").put("all")
+        elif decision == "yes":
+            payload.get("response").put("yes")
+        elif decision == "no":
+            payload.get("response").put("no")
+        else:
+            payload.get("response").put("no")
+
+    def handle_deleted(payload):
+        path = payload.get("path")
+        if path:
+            log_add(info_box, f"已移入回收站：{path}")
+
+    def handle_error(payload):
+        msg = payload.get("error") or "检测失败"
+        log_add(info_box, f"检测错误：{msg}")
+
+    def finalize(payload):
+        global CURRENT_DETECTION_SESSION
+        if session.finished:
+            return
+        session.finished = True
+        set_button_state(pause_btn, active=False)
+        set_button_state(cancel_btn, active=False, style_active="AuroraDanger.TButton")
+        session.progress_var.set(100.0 if not session.was_cancelled else session.progress_var.get())
+        if session.was_cancelled or session.cancel_ev.is_set():
+            session.status_var.set("检测已取消")
+            session.eta_var.set("已取消")
+        else:
+            session.status_var.set("检测完成")
+            session.eta_var.set("完成")
+            session.progress_var.set(100.0)
+            session.percent_var.set("进度: 100.0%")
+        records = payload.get("records") if isinstance(payload, dict) else None
+        if records:
+            ts_now = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_path = os.path.join(session.root_dir, f"eye_detection_deleted_{ts_now}.csv")
+            try:
+                with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["time", "path", "reason"])
+                    for row in records:
+                        writer.writerow([row.get("time"), row.get("path"), row.get("reason")])
+                log_add(info_box, f"删除记录已保存：{csv_path}")
+            except Exception as exc:
+                log_add(info_box, f"保存删除日志失败：{exc}")
+        refresh_status()
+        session.eta_var.set("完成" if not session.was_cancelled else "已取消")
+        CURRENT_DETECTION_SESSION = None
+
+    def pump():
+        try:
+            while True:
+                kind, payload = session.queue.get_nowait()
+                if kind == "total":
+                    session.total_bytes = payload
+                elif kind == "bytes":
+                    update_progress(payload)
+                elif kind == "file":
+                    handle_file(payload)
+                elif kind == "prompt":
+                    handle_prompt(payload)
+                elif kind == "deleted":
+                    handle_deleted(payload)
+                elif kind == "error":
+                    handle_error(payload)
+                elif kind == "done":
+                    finalize(payload)
+        except queue.Empty:
+            pass
+        if not session.finished:
+            root.after(50, pump)
+
+    def toggle_pause():
+        if session.finished:
+            return
+        if not session.pause_ev.is_set():
+            session.pause_ev.set()
+            session.status_var.set("已暂停")
+            session.eta_var.set("已暂停")
+            pause_btn.config(text="继续")
+            set_button_state(pause_btn, active=True, style_active="AuroraWarning.TButton")
+            log_add(info_box, "检测已暂停")
+        else:
+            session.pause_ev.clear()
+            session.status_var.set("检测中…")
+            session.eta_var.set("剩余时间：计算中…")
+            pause_btn.config(text="暂停")
+            set_button_state(pause_btn, active=True, style_active="AuroraPrimary.TButton")
+            log_add(info_box, "检测继续执行")
+
+    def do_cancel():
+        if session.finished:
+            return
+        session.was_cancelled = True
+        session.cancel_ev.set()
+        set_button_state(pause_btn, active=False)
+        set_button_state(cancel_btn, active=False, style_active="AuroraDanger.TButton")
+        session.status_var.set("取消中…")
+        session.eta_var.set("取消中…")
+        log_add(info_box, "检测取消中…")
+
+    def close_window():
+        if not session.finished:
+            session.was_cancelled = True
+            session.cancel_ev.set()
+        win.destroy()
+
+    pause_btn.configure(command=toggle_pause)
+    cancel_btn.configure(command=do_cancel)
+
+    win.protocol("WM_DELETE_WINDOW", close_window)
+
+    set_button_state(pause_btn, active=True, style_active="AuroraPrimary.TButton")
+    set_button_state(cancel_btn, active=True, style_active="AuroraDanger.TButton")
+    session.status_var.set("检测中…")
+
+    worker = threading.Thread(target=process_batch, args=(paths, session.queue), daemon=True)
+    worker.start()
+    pump()
 
 # ---------- 扫描/计划 ----------
 def preflight_scan(src_root):
@@ -1188,6 +1939,38 @@ def aurora_askretrycancel(title, message, parent=None):
         )
     )
 
+
+def aurora_ask_eye_delete(parent=None):
+    toplevel = _normalize_parent(parent)
+    if not _can_use_modal(toplevel):
+        res = messagebox.askquestion(
+            "确认删除",
+            "检测到闭眼，是否删除？\n（将移入回收站，可撤销）",
+            icon="warning",
+            type=messagebox.YESNOCANCEL,
+            parent=parent,
+        )
+        if res == "yes":
+            return "yes"
+        if res == "no":
+            return "no"
+        return "cancel"
+
+    result = _aurora_modal(
+        "确认删除",
+        "检测到闭眼，是否删除？\n（将移入回收站，可撤销）",
+        level="warning",
+        buttons=[
+            ("否", "AuroraGhost.TButton", "no"),
+            ("是", "AuroraPrimary.TButton", "yes"),
+            ("对本次全部", "AuroraWarning.TButton", "all"),
+        ],
+        parent=toplevel,
+        default_index=1,
+        close_value="cancel",
+    )
+    return result
+
 # ---------- 列表刷新 ----------
 def refresh_sources(info_box, combo_src, auto_pick=False):
     all_drives=list_drives()
@@ -1246,6 +2029,7 @@ def start_copy(
     pause_btn,
     cancel_btn,
     star_btn,
+    detect_btn,
     star_refresh_cb,
     state,
     extract_star=False,
@@ -1366,6 +2150,8 @@ def start_copy(
     pause_btn.config(text="暂停")
     set_button_state(cancel_btn, active=False, style_active="AuroraDanger.TButton")
     set_button_state(star_btn, active=False)
+    if detect_btn is not None:
+        set_button_state(detect_btn, active=False)
 
     state.is_copying = True
     state.is_paused = False
@@ -1462,6 +2248,8 @@ def start_copy(
             pause_btn.config(text="暂停")
             set_button_state(cancel_btn, active=False, style_active="AuroraDanger.TButton")
             set_button_state(star_btn, active=True)
+            if detect_btn is not None:
+                set_button_state(detect_btn, active=True)
             if star_refresh_cb is not None:
                 try:
                     star_refresh_cb()
@@ -2113,6 +2901,7 @@ def main_ui():
             pause_btn,
             cancel_btn,
             star_btn,
+            detect_btn,
             refresh_star_button_visual,
             state,
             extract_star=extract_star_flag,
@@ -2124,6 +2913,14 @@ def main_ui():
     open_btn = ttk.Button(card3, text="打开文件夹", style="AuroraPrimary.TButton", command=open_current_month)
     open_btn.grid(row=2, column=1, sticky="w", padx=(16, 0), pady=(18, 0))
 
+    detect_btn = ttk.Button(
+        card3,
+        text="闭眼与曝光检测",
+        style="AuroraPrimary.TButton",
+        command=lambda: launch_eye_detection(root, info_box),
+    )
+    detect_btn.grid(row=2, column=2, sticky="w", padx=(16, 0), pady=(18, 0))
+
     pause_btn = ttk.Button(card3, text="暂停", style="AuroraPrimary.TButton", command=on_pause, state="disabled")
     pause_btn.grid(row=2, column=3, sticky="e", padx=(0, 0), pady=(18, 0))
 
@@ -2132,6 +2929,7 @@ def main_ui():
 
     set_button_state(btn_start, active=True)
     set_button_state(open_btn, active=True)
+    set_button_state(detect_btn, active=True)
     set_button_state(pause_btn, active=False)
     pause_btn.config(text="暂停")
     set_button_state(cancel_btn, active=False, style_active="AuroraDanger.TButton")
