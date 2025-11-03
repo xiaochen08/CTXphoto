@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from types import SimpleNamespace
 
+
 from app.bootstrap_models import get_current_providers, register_session_builder, rebuild_sessions
 from app.providers import cuda_available, load_pref, pick_providers, save_pref
 
@@ -59,6 +60,32 @@ except Exception:  # pragma: no cover - optional dependency fallback
     exifread = None
     if not SUPPRESS_RUNTIME_WARNINGS:
         print("[警告] 未检测到 exifread，将使用文件修改时间作为拍摄时间。", file=sys.stderr)
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    np = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 numpy，部分智能检测功能将受限。", file=sys.stderr)
+
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    mp = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 MediaPipe，无法启用智能闭眼检测。", file=sys.stderr)
+
+try:
+    from insightface.app import FaceAnalysis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    FaceAnalysis = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[提示] 未检测到 insightface，GPU 加速闭眼检测将不可用。", file=sys.stderr)
+
+try:
+    import onnxruntime  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    onnxruntime = None
 
 try:
     import numpy as np  # type: ignore
@@ -440,12 +467,15 @@ class PhotoWasteDetector:
         self._insightface = None
         self.eye_detection_ready = False
         self.requirements_hint = (
-            "1) CPU 精准检测：pip install mediapipe==0.10.9 opencv-python numpy\n"
-            "2) GPU 加速建议：pip install insightface onnxruntime-gpu\n"
-            "   并下载模型 https://huggingface.co/deepinsight/insightface/resolve/main/models/buffalo_l.zip\n"
+            "安装依赖：pip install mediapipe==0.10.9 opencv-python numpy\n"
+            "可选安装 insightface 与 onnxruntime 以启用更精准的人眼检测（CPU 模式）。\n"
+            "模型下载：https://huggingface.co/deepinsight/insightface/resolve/main/models/buffalo_l.zip\n"
             "安装后将模型解压到 %APPDATA%/insightface/models 或 ~/.insightface/models。"
         )
-        self.providers = list(providers) if providers else ["CPUExecutionProvider"]
+        desired = list(providers) if providers else ["CPUExecutionProvider"]
+        if not desired:
+            desired = ["CPUExecutionProvider"]
+        self.providers = desired
         self.current_providers: List[str] = list(self.providers)
         self.available_providers: List[str] = []
         self.refresh_available_providers()
@@ -499,18 +529,16 @@ class PhotoWasteDetector:
                 print(f"[提示] InsightFace 初始化失败：{exc}", file=sys.stderr)
 
     def set_providers(self, providers: List[str]) -> Dict[str, List[str]]:
-        desired = list(providers) or ["CPUExecutionProvider"]
+        desired = ["CPUExecutionProvider"]
         self.providers = list(desired)
+        self.current_providers = list(desired)
         if FaceAnalysis is not None and onnxruntime is not None:
             try:
                 engine = FaceAnalysis(name="buffalo_l", providers=desired)
                 engine.prepare(ctx_id=0, det_size=(640, 640))
                 self._insightface = engine
-                self.current_providers = list(desired)
             except Exception as exc:
                 raise RuntimeError(f"InsightFace 初始化失败：{exc}") from exc
-        else:
-            self.current_providers = list(desired)
         return {"providers": list(self.current_providers)}
 
     def describe_model_inventory(self) -> List[str]:
@@ -705,9 +733,7 @@ class WasteDetectionUI:
         self.frame = frame
         self.theme_key = theme_key
         self.on_back = on_back
-        self._pref = load_pref()
-        initial_providers = pick_providers(self._pref.get("prefer_cuda", True))
-        self.detector = PhotoWasteDetector(initial_providers)
+        self.detector = PhotoWasteDetector(["CPUExecutionProvider"])
         self.folder_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="待机")
         self.summary_var = tk.StringVar(value="尚未检测")
@@ -734,7 +760,6 @@ class WasteDetectionUI:
         self._build_ui()
         self.apply_theme(theme_key)
         self._update_detector_hint()
-        self._register_rebuilder()
         self._log_provider_status()
 
     def _build_ui(self) -> None:
@@ -769,18 +794,16 @@ class WasteDetectionUI:
 
         btn_row = ttk.Frame(control_card, style="AuroraCard.TFrame")
         btn_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(18, 0))
-        for col in range(4):
+        for col in range(3):
             btn_row.grid_columnconfigure(col, weight=0)
-        btn_row.grid_columnconfigure(3, weight=1)
+        btn_row.grid_columnconfigure(2, weight=1)
 
         self.start_btn = ttk.Button(btn_row, text="开始检测", style="AuroraPrimary.TButton", command=self.start_detection)
         self.start_btn.grid(row=0, column=0, sticky="w")
         self.stop_btn = ttk.Button(btn_row, text="停止", style="AuroraWarning.TButton", command=self.stop_detection, state="disabled")
         self.stop_btn.grid(row=0, column=1, sticky="w", padx=(16, 0))
-        self.cuda_btn = ttk.Button(btn_row, text="CUDA 加速", style="AuroraPrimary.TButton", command=self._toggle_cuda)
-        self.cuda_btn.grid(row=0, column=2, sticky="w", padx=(16, 0))
         self.back_btn = ttk.Button(btn_row, text="返回导入界面", style="AuroraGhost.TButton", command=self._handle_back)
-        self.back_btn.grid(row=0, column=3, sticky="e")
+        self.back_btn.grid(row=0, column=2, sticky="e")
 
         progress_panel = ttk.Frame(control_card, style="AuroraCard.TFrame")
         progress_panel.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(20, 0))
@@ -867,14 +890,12 @@ class WasteDetectionUI:
         self.tree.bind("<Double-1>", self.on_tree_double_click)
 
         set_button_state(self.stop_btn, active=False, style_active="AuroraWarning.TButton")
-        self._refresh_cuda_button()
 
     def apply_theme(self, theme_key: str) -> None:
         self.theme_key = theme_key
         set_text_theme(self.log_text, theme_key)
         bg = AURORA_THEME["CARD_HIGHLIGHT"]
         self.preview_canvas.configure(bg=bg)
-        self._refresh_cuda_button()
 
     def _update_detector_hint(self) -> None:
         if self.detector.eye_detection_ready:
@@ -886,81 +907,25 @@ class WasteDetectionUI:
             )
         providers = getattr(self.detector, "available_providers", [])
         if providers:
-            hint += f"\n可用 ONNX Runtime 推理引擎：{', '.join(providers)}"
+            hint += f"\n已检测到 ONNX Runtime providers：{', '.join(providers)}"
         elif onnxruntime is None:
-            hint += "\n(未检测到 onnxruntime，可按需安装 onnxruntime 或 onnxruntime-gpu)"
+            hint += "\n(未检测到 onnxruntime，可按需安装 onnxruntime。)"
         if FaceAnalysis is None:
-            hint += "\n(未检测到 insightface，GPU 大模型需单独安装。)"
+            hint += "\n(未检测到 insightface，可选安装以提升检测准确度。)"
         self.detector_hint.configure(text=hint)
-
-    def _register_rebuilder(self) -> None:
-        def _builder(providers: List[str]):
-            return self.detector.set_providers(list(providers))
-
-        register_session_builder("waste-detector", _builder)
-        errors = rebuild_sessions(self.detector.current_providers)
-        if errors:
-            self._log_rebuild_errors(errors)
-            fallback = pick_providers(False)
-            rebuild_sessions(fallback)
-            self.detector.set_providers(fallback)
-            self._pref["prefer_cuda"] = False
-            save_pref(self._pref)
-            self._refresh_cuda_button()
-            self._log("初始化 CUDA 失败，已回退到 CPUExecutionProvider。")
-
-    def _log_rebuild_errors(self, errors: List[Tuple[str, Exception]]) -> None:
-        for name, exc in errors:
-            self._log(f"重建会话失败（{name}）：{exc}")
 
     def _log_provider_status(self) -> None:
         providers = self.detector.refresh_available_providers()
         if onnxruntime is None:
             self._log("未检测到 onnxruntime，默认使用 CPUExecutionProvider。")
         elif providers:
-            self._log(f"可用推理引擎：{', '.join(providers)}")
+            self._log(f"已检测到的 providers：{', '.join(providers)}")
         else:
             self._log("onnxruntime 未返回可用 providers，已回退到 CPU。")
-        current = get_current_providers() or self.detector.current_providers
+        current = self.detector.current_providers
         self._log(f"当前推理 providers：{', '.join(current)}")
         for line in self.detector.describe_model_inventory():
             self._log(line)
-
-    def _refresh_cuda_button(self) -> None:
-        available = cuda_available()
-        prefer = self._pref.get("prefer_cuda", True)
-        if not available:
-            self.cuda_btn.config(text="CUDA 加速", style="AuroraDisabled.TButton", state="disabled", cursor="arrow")
-            return
-        text = "CUDA 加速 ✓" if prefer else "CUDA 加速"
-        style = "AuroraSuccess.TButton" if prefer else "AuroraPrimary.TButton"
-        self.cuda_btn.config(text=text, style=style, state="normal", cursor="hand2")
-
-    def _toggle_cuda(self) -> None:
-        if not cuda_available():
-            return
-        prefer = self._pref.get("prefer_cuda", True)
-        new_prefer = not prefer
-        self._pref["prefer_cuda"] = new_prefer
-        save_pref(self._pref)
-        target = pick_providers(new_prefer)
-        self._log(f"尝试切换推理 providers：{', '.join(target)}")
-        errors = rebuild_sessions(target)
-        if errors:
-            self._log_rebuild_errors(errors)
-            aurora_showwarning("CUDA 切换失败", "无法启用 CUDA，加速已回退到 CPU。", parent=self.root)
-            self._pref["prefer_cuda"] = False
-            save_pref(self._pref)
-            fallback = pick_providers(False)
-            fallback_errors = rebuild_sessions(fallback)
-            if fallback_errors:
-                self._log_rebuild_errors(fallback_errors)
-            self.detector.set_providers(fallback)
-            self._log("已切换到 CPUExecutionProvider。")
-        else:
-            self._log(f"推理会话已重建，当前 providers：{', '.join(get_current_providers())}")
-        self._refresh_cuda_button()
-        self._update_detector_hint()
 
     def _init_progress_state(self) -> None:
         now = time.time()
@@ -1120,7 +1085,7 @@ class WasteDetectionUI:
         set_button_state(self.start_btn, active=False)
         set_button_state(self.stop_btn, active=True, style_active="AuroraWarning.TButton")
         self._log(f"开始检测，共 {self._total_files} 张 JPG 照片。")
-        current_providers = get_current_providers() or self.detector.current_providers
+        current_providers = self.detector.current_providers
         self._log(f"使用推理 providers：{', '.join(current_providers)}")
 
         def _worker():
