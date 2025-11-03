@@ -25,6 +25,7 @@ from types import SimpleNamespace
 
 
 
+
 from app.bootstrap_models import get_current_providers, register_session_builder, rebuild_sessions
 from app.providers import cuda_available, load_pref, pick_providers, save_pref
 
@@ -35,6 +36,12 @@ THEMES = ["暗黑"]
 DEFAULT_THEME_KEY = "dark"
 LOG_PANEL_WIDTH = 360
 COPY_BUFFER_SIZE = 4 * 1024 * 1024
+
+DEFAULT_WASTE_SETTINGS = {
+    "quality_threshold": 90,
+    "overexposure_threshold": 85,
+    "underexposure_threshold": 15,
+}
 
 DEFAULT_WASTE_SETTINGS = {
     "quality_threshold": 90,
@@ -69,6 +76,32 @@ except Exception:  # pragma: no cover - optional dependency fallback
     exifread = None
     if not SUPPRESS_RUNTIME_WARNINGS:
         print("[警告] 未检测到 exifread，将使用文件修改时间作为拍摄时间。", file=sys.stderr)
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    np = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 numpy，部分智能检测功能将受限。", file=sys.stderr)
+
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    mp = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 MediaPipe，无法启用智能闭眼检测。", file=sys.stderr)
+
+try:
+    from insightface.app import FaceAnalysis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    FaceAnalysis = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[提示] 未检测到 insightface，GPU 加速闭眼检测将不可用。", file=sys.stderr)
+
+try:
+    import onnxruntime  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    onnxruntime = None
 
 try:
     import numpy as np  # type: ignore
@@ -382,6 +415,7 @@ def load_config():
             else:
                 for key, value in DEFAULT_WASTE_SETTINGS.items():
                     cfg["waste_detection"].setdefault(key, value)
+                cfg["waste_detection"].pop("realtime_filter", None)
             return cfg
     default_cfg = {"last_target_root": "", "theme": DEFAULT_THEME_KEY, "sash_ratio": 0.55}
     default_cfg["waste_detection"] = dict(DEFAULT_WASTE_SETTINGS)
@@ -528,6 +562,8 @@ class DetectionResult:
     clipped_ratio: float = 0.0
     overexposure_ratio: float = 0.0
     underexposure_ratio: float = 0.0
+    high_light_ratio: float = 0.0
+    low_light_ratio: float = 0.0
     quality_score: float = 100.0
     is_waste: bool = False
 
@@ -783,6 +819,8 @@ class PhotoWasteDetector:
         result.clipped_ratio = clipped_ratio
         result.overexposure_ratio = bright_ratio * 100.0
         result.underexposure_ratio = dark_ratio * 100.0
+        result.high_light_ratio = bright_ratio * 100.0
+        result.low_light_ratio = dark_ratio * 100.0
 
     def analyze_image(self, path: str) -> Optional[DetectionResult]:
         if Image is None:
@@ -809,168 +847,6 @@ class PhotoWasteDetector:
             return None
         return result
 
-
-class DetectionParamsPanel:
-    def __init__(
-        self,
-        parent: ttk.Frame,
-        settings: Dict[str, Any],
-        on_change,
-    ) -> None:
-        self._on_change = on_change
-        self.frame = ttk.Frame(parent, style="AuroraCard.TFrame", padding=(28, 24))
-        self.frame.grid_columnconfigure(0, weight=1)
-
-        header = ttk.Frame(self.frame, style="AuroraCard.TFrame")
-        header.grid(row=0, column=0, sticky="ew")
-        header.grid_columnconfigure(0, weight=1)
-
-        ttk.Label(header, text="检测参数", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w")
-        self._collapsed = False
-        self._toggle_btn = ttk.Button(
-            header,
-            text="收起",
-            style="AuroraGhost.TButton",
-            command=self._toggle,
-        )
-        self._toggle_btn.grid(row=0, column=1, sticky="e")
-
-        self.content = ttk.Frame(self.frame, style="AuroraCard.TFrame")
-        self.content.grid(row=1, column=0, sticky="nsew", pady=(18, 0))
-        for col in range(2):
-            self.content.grid_columnconfigure(col, weight=1 if col == 1 else 0)
-
-        self.quality_var = tk.IntVar(value=int(settings.get("quality_threshold", 90)))
-        self.over_var = tk.IntVar(value=int(settings.get("overexposure_threshold", 85)))
-        self.under_var = tk.IntVar(value=int(settings.get("underexposure_threshold", 15)))
-        self.realtime_var = tk.BooleanVar(value=bool(settings.get("realtime_filter", True)))
-
-        ttk.Label(self.content, text="废片检测率阈值", style="AuroraBody.TLabel").grid(row=0, column=0, sticky="w")
-        radios = ttk.Frame(self.content, style="AuroraCard.TFrame")
-        radios.grid(row=0, column=1, sticky="ew")
-        for idx, value in enumerate((80, 90, 95, 100)):
-            rb = ttk.Radiobutton(
-                radios,
-                text=f">= {value}%",
-                value=value,
-                variable=self.quality_var,
-                command=self._emit_change,
-            )
-            rb.grid(row=0, column=idx, padx=(0 if idx == 0 else 12, 0))
-
-        ttk.Label(self.content, text="过曝阈值", style="AuroraBody.TLabel").grid(row=1, column=0, sticky="w", pady=(16, 0))
-        over_frame = ttk.Frame(self.content, style="AuroraCard.TFrame")
-        over_frame.grid(row=1, column=1, sticky="ew", pady=(16, 0))
-        over_frame.grid_columnconfigure(0, weight=1)
-        self.over_value_var = tk.StringVar()
-        self._update_over_label()
-        self.over_scale = ttk.Scale(
-            over_frame,
-            from_=0,
-            to=100,
-            orient="horizontal",
-            command=self._on_over_scale,
-        )
-        self.over_scale.set(self.over_var.get())
-        self.over_scale.grid(row=0, column=0, sticky="ew")
-        ttk.Label(over_frame, textvariable=self.over_value_var, style="AuroraCaption.TLabel").grid(
-            row=0, column=1, sticky="e", padx=(12, 0)
-        )
-
-        ttk.Label(self.content, text="欠曝阈值", style="AuroraBody.TLabel").grid(row=2, column=0, sticky="w", pady=(16, 0))
-        under_frame = ttk.Frame(self.content, style="AuroraCard.TFrame")
-        under_frame.grid(row=2, column=1, sticky="ew", pady=(16, 0))
-        under_frame.grid_columnconfigure(0, weight=1)
-        self.under_value_var = tk.StringVar()
-        self._update_under_label()
-        self.under_scale = ttk.Scale(
-            under_frame,
-            from_=0,
-            to=100,
-            orient="horizontal",
-            command=self._on_under_scale,
-        )
-        self.under_scale.set(self.under_var.get())
-        self.under_scale.grid(row=0, column=0, sticky="ew")
-        ttk.Label(under_frame, textvariable=self.under_value_var, style="AuroraCaption.TLabel").grid(
-            row=0, column=1, sticky="e", padx=(12, 0)
-        )
-
-        options_row = ttk.Frame(self.content, style="AuroraCard.TFrame")
-        options_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(16, 0))
-        options_row.grid_columnconfigure(0, weight=1)
-        self.realtime_check = ttk.Checkbutton(
-            options_row,
-            text="实时筛选",
-            variable=self.realtime_var,
-            command=self._emit_change,
-        )
-        self.realtime_check.grid(row=0, column=0, sticky="w")
-        ttk.Button(
-            options_row,
-            text="重置",
-            style="AuroraGhost.TButton",
-            command=self._reset,
-        ).grid(row=0, column=1, sticky="e")
-
-    def _toggle(self) -> None:
-        self._collapsed = not self._collapsed
-        if self._collapsed:
-            self.content.grid_remove()
-            self._toggle_btn.config(text="展开")
-        else:
-            self.content.grid()
-            self._toggle_btn.config(text="收起")
-
-    def _emit_change(self) -> None:
-        if callable(self._on_change):
-            self._on_change()
-
-    def _reset(self) -> None:
-        self.quality_var.set(DEFAULT_WASTE_SETTINGS["quality_threshold"])
-        self.over_var.set(DEFAULT_WASTE_SETTINGS["overexposure_threshold"])
-        self.under_var.set(DEFAULT_WASTE_SETTINGS["underexposure_threshold"])
-        self.realtime_var.set(DEFAULT_WASTE_SETTINGS["realtime_filter"])
-        self.over_scale.set(self.over_var.get())
-        self.under_scale.set(self.under_var.get())
-        self._update_over_label()
-        self._update_under_label()
-        self._emit_change()
-
-    def _update_over_label(self) -> None:
-        self.over_value_var.set(f"{self.over_var.get()}%")
-
-    def _update_under_label(self) -> None:
-        self.under_value_var.set(f"{self.under_var.get()}%")
-
-    def _on_over_scale(self, value: str) -> None:
-        try:
-            self.over_var.set(int(float(value)))
-        except Exception:
-            return
-        self._update_over_label()
-        self._emit_change()
-
-    def _on_under_scale(self, value: str) -> None:
-        try:
-            self.under_var.set(int(float(value)))
-        except Exception:
-            return
-        self._update_under_label()
-        self._emit_change()
-
-    def get_values(self) -> Dict[str, Any]:
-        return {
-            "quality_threshold": int(self.quality_var.get()),
-            "overexposure_threshold": int(self.over_var.get()),
-            "underexposure_threshold": int(self.under_var.get()),
-            "realtime_filter": bool(self.realtime_var.get()),
-        }
-
-    def set_realtime_filter(self, value: bool, notify: bool = True) -> None:
-        self.realtime_var.set(bool(value))
-        if notify:
-            self._emit_change()
 
 class WasteDetectionUI:
     def __init__(self, root: tk.Tk, frame: ttk.Frame, theme_key: str, on_back) -> None:
@@ -1002,12 +878,25 @@ class WasteDetectionUI:
 
         self._config = load_config()
         self._settings = dict(self._config.get("waste_detection", DEFAULT_WASTE_SETTINGS))
+        self._settings.pop("realtime_filter", None)
+        self.quality_var = tk.IntVar(value=int(self._settings.get("quality_threshold", 90)))
+        self.over_var = tk.IntVar(value=int(self._settings.get("overexposure_threshold", 85)))
+        self.under_var = tk.IntVar(value=int(self._settings.get("underexposure_threshold", 15)))
+        self._settings["quality_threshold"] = int(self.quality_var.get())
+        self._settings["overexposure_threshold"] = int(self.over_var.get())
+        self._settings["underexposure_threshold"] = int(self.under_var.get())
         self._all_results: Dict[str, DetectionResult] = {}
         self._result_order: List[str] = []
         self._tree_items: Dict[str, str] = {}
-        self.filter_summary_var = tk.StringVar(value="筛选：尚未开始")
+        self.filter_summary_var = tk.StringVar(value="筛选结果：尚未开始")
+        self.threshold_summary_var = tk.StringVar(value="")
+        self.over_value_var = tk.StringVar(value=f"{self.over_var.get()}%")
+        self.under_value_var = tk.StringVar(value=f"{self.under_var.get()}%")
+        self._suspend_threshold_callbacks = True
 
         self._build_ui()
+        self._suspend_threshold_callbacks = False
+        self._update_threshold_summary()
         self.apply_theme(theme_key)
         self._update_detector_hint()
         self._log_provider_status()
@@ -1082,50 +971,108 @@ class WasteDetectionUI:
             row=6, column=0, columnspan=3, sticky="w", pady=(8, 0)
         )
 
-        self.params_panel = DetectionParamsPanel(left_col, self._settings, self._on_params_change)
-        self.params_panel.frame.grid(row=1, column=0, sticky="ew", pady=(20, 0))
-
         results_card = ttk.Frame(left_col, style="AuroraCard.TFrame", padding=(28, 24))
-        results_card.grid(row=2, column=0, sticky="nsew", pady=(20, 0))
-        results_card.grid_rowconfigure(2, weight=1)
+        results_card.grid(row=1, column=0, sticky="nsew", pady=(20, 0))
+        results_card.grid_rowconfigure(4, weight=1)
+        results_card.grid_rowconfigure(6, weight=1)
         results_card.grid_columnconfigure(0, weight=1)
         results_card.grid_columnconfigure(1, weight=0)
         results_card.grid_columnconfigure(2, weight=0)
-        ttk.Label(results_card, text="检测结果", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(results_card, text="检测结果", style="AuroraSection.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
 
-        ttk.Label(results_card, textvariable=self.filter_summary_var, style="AuroraCaption.TLabel").grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(12, 0)
+        ttk.Label(results_card, textvariable=self.threshold_summary_var, style="AuroraStatus.TLabel").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(10, 0)
         )
 
-        columns = ("filename", "status", "issues", "over", "under", "brightness", "clip", "path")
+        controls_frame = ttk.Frame(results_card, style="AuroraCard.TFrame")
+        controls_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+        for col in range(3):
+            controls_frame.grid_columnconfigure(col, weight=1)
+
+        quality_frame = ttk.Frame(controls_frame, style="AuroraCard.TFrame")
+        quality_frame.grid(row=0, column=0, sticky="ew")
+        quality_frame.grid_columnconfigure(0, weight=1)
+        ttk.Label(quality_frame, text="废片检测率阈值", style="AuroraBody.TLabel").grid(row=0, column=0, sticky="w")
+        quality_buttons = ttk.Frame(quality_frame, style="AuroraCard.TFrame")
+        quality_buttons.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        for idx, value in enumerate((80, 90, 95, 100)):
+            ttk.Radiobutton(
+                quality_buttons,
+                text=f"{value}%",
+                value=value,
+                variable=self.quality_var,
+                command=self._on_quality_change,
+            ).grid(row=0, column=idx, padx=(0 if idx == 0 else 12, 0))
+
+        over_frame = ttk.Frame(controls_frame, style="AuroraCard.TFrame")
+        over_frame.grid(row=0, column=1, sticky="ew", padx=(12, 0))
+        over_frame.grid_columnconfigure(0, weight=1)
+        ttk.Label(over_frame, text="过曝率阈值", style="AuroraBody.TLabel").grid(row=0, column=0, sticky="w")
+        self.over_scale = ttk.Scale(over_frame, from_=0, to=100, orient="horizontal", command=self._on_over_scale)
+        self.over_scale.set(self.over_var.get())
+        self.over_scale.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(over_frame, textvariable=self.over_value_var, style="AuroraCaption.TLabel").grid(
+            row=2, column=0, sticky="e", pady=(6, 0)
+        )
+
+        under_frame = ttk.Frame(controls_frame, style="AuroraCard.TFrame")
+        under_frame.grid(row=0, column=2, sticky="ew", padx=(12, 0))
+        under_frame.grid_columnconfigure(0, weight=1)
+        ttk.Label(under_frame, text="欠曝率阈值", style="AuroraBody.TLabel").grid(row=0, column=0, sticky="w")
+        self.under_scale = ttk.Scale(under_frame, from_=0, to=100, orient="horizontal", command=self._on_under_scale)
+        self.under_scale.set(self.under_var.get())
+        self.under_scale.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(under_frame, textvariable=self.under_value_var, style="AuroraCaption.TLabel").grid(
+            row=2, column=0, sticky="e", pady=(6, 0)
+        )
+
+        ttk.Label(results_card, textvariable=self.filter_summary_var, style="AuroraCaption.TLabel").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(12, 0)
+        )
+
+        columns = (
+            "filename",
+            "status",
+            "issues",
+            "over",
+            "under",
+            "highlight",
+            "lowlight",
+            "brightness",
+            "quality",
+            "path",
+        )
         self.tree = ttk.Treeview(results_card, columns=columns, show="headings", height=12, selectmode="browse")
         self.tree.heading("filename", text="文件名")
-        self.tree.heading("status", text="标记状态")
-        self.tree.heading("issues", text="问题")
-        self.tree.heading("over", text="过曝率%")
-        self.tree.heading("under", text="欠曝率%")
+        self.tree.heading("status", text="检测类型")
+        self.tree.heading("issues", text="闭眼")
+        self.tree.heading("over", text="过曝率 %")
+        self.tree.heading("under", text="欠曝率 %")
+        self.tree.heading("highlight", text="高光占比 %")
+        self.tree.heading("lowlight", text="低光占比 %")
         self.tree.heading("brightness", text="平均亮度")
-        self.tree.heading("clip", text="高/低光占比")
-        self.tree.column("filename", width=240, anchor="w")
-        self.tree.column("status", width=90, anchor="center")
+        self.tree.heading("quality", text="质量分数")
+        self.tree.column("filename", width=220, anchor="w")
+        self.tree.column("status", width=100, anchor="center")
         self.tree.column("issues", width=220, anchor="w")
-        self.tree.column("over", width=100, anchor="center")
-        self.tree.column("under", width=100, anchor="center")
-        self.tree.column("brightness", width=100, anchor="center")
-        self.tree.column("clip", width=120, anchor="center")
+        self.tree.column("over", width=110, anchor="center")
+        self.tree.column("under", width=110, anchor="center")
+        self.tree.column("highlight", width=120, anchor="center")
+        self.tree.column("lowlight", width=120, anchor="center")
+        self.tree.column("brightness", width=110, anchor="center")
+        self.tree.column("quality", width=110, anchor="center")
         self.tree.column("path", width=0, stretch=False)
-        self.tree.grid(row=2, column=0, sticky="nsew", pady=(18, 0))
+        self.tree.grid(row=4, column=0, sticky="nsew", pady=(18, 0))
 
         tree_scroll = ttk.Scrollbar(results_card, orient="vertical", command=self.tree.yview, style="Aurora.Vertical.TScrollbar")
-        tree_scroll.grid(row=2, column=1, sticky="ns", pady=(18, 0))
+        tree_scroll.grid(row=4, column=1, sticky="ns", pady=(18, 0))
         self.tree.configure(yscrollcommand=tree_scroll.set)
 
         self.tree_menu = tk.Menu(self.tree, tearoff=0)
-        self.tree_menu.add_command(label="仅提取当前筛选命中项到‘废片’", command=self._extract_filtered_to_waste)
-        self.tree_menu.add_command(label="清除筛选显示全部", command=self._clear_filter)
+        self.tree_menu.add_command(label="提取当前筛选结果到‘废片’", command=self._extract_filtered_to_waste)
 
         action_row = ttk.Frame(results_card, style="AuroraCard.TFrame")
-        action_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        action_row.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(16, 0))
         action_row.grid_columnconfigure(0, weight=0)
         action_row.grid_columnconfigure(1, weight=0)
         action_row.grid_columnconfigure(2, weight=1)
@@ -1136,9 +1083,9 @@ class WasteDetectionUI:
         self.delete_btn.grid(row=0, column=1, sticky="w", padx=(16, 0))
 
         self.log_text = tk.Text(results_card, height=6, wrap="word", bd=0, relief="flat", state="disabled")
-        self.log_text.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(18, 0))
+        self.log_text.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(18, 0))
         log_scroll = ttk.Scrollbar(results_card, orient="vertical", command=self.log_text.yview, style="Aurora.Vertical.TScrollbar")
-        log_scroll.grid(row=3, column=2, sticky="ns", pady=(18, 0))
+        log_scroll.grid(row=6, column=2, sticky="ns", pady=(18, 0))
         self.log_text.configure(yscrollcommand=log_scroll.set)
 
         right_card = ttk.Frame(self.frame, style="AuroraCard.TFrame", padding=(28, 24))
@@ -1158,7 +1105,7 @@ class WasteDetectionUI:
         self.tree.bind("<Button-3>", self._on_tree_right_click)
 
         set_button_state(self.stop_btn, active=False, style_active="AuroraWarning.TButton")
-        self._update_filter_summary(0)
+        self._update_filter_summary()
 
     def apply_theme(self, theme_key: str) -> None:
         self.theme_key = theme_key
@@ -1348,7 +1295,7 @@ class WasteDetectionUI:
         self._init_progress_state()
         self.status_var.set(f"检测中：0/{self._total_files}")
         self._update_summary()
-        self._update_filter_summary(0)
+        self._update_filter_summary()
         set_button_state(self.start_btn, active=False)
         set_button_state(self.stop_btn, active=True, style_active="AuroraWarning.TButton")
         self._log(f"开始检测，共 {self._total_files} 张 JPG 照片。")
@@ -1455,8 +1402,6 @@ class WasteDetectionUI:
             self._over_count -= 1
 
     def _matches_filter(self, detection: DetectionResult) -> bool:
-        if not self._settings.get("realtime_filter", True):
-            return True
         quality_threshold = float(self._settings.get("quality_threshold", 90))
         over_threshold = float(self._settings.get("overexposure_threshold", 85))
         under_threshold = float(self._settings.get("underexposure_threshold", 15))
@@ -1465,28 +1410,30 @@ class WasteDetectionUI:
         under_hit = detection.underexposure_ratio >= under_threshold
         return waste_hit or over_hit or under_hit
 
-    def _tree_row_values(self, detection: DetectionResult) -> Tuple[str, str, str, str, str, str, str, str]:
+    def _tree_row_values(self, detection: DetectionResult) -> Tuple[str, ...]:
         issues_text = "、".join(detection.issues) if detection.issues else "--"
         brightness_text = f"{detection.mean_luminance:.1f}" if detection.mean_luminance else "--"
-        clip_text = f"{detection.clipped_ratio * 100:.1f}%" if detection.clipped_ratio else "0.0%"
         over_text = f"{detection.overexposure_ratio:.1f}%"
         under_text = f"{detection.underexposure_ratio:.1f}%"
+        highlight_text = f"{detection.high_light_ratio:.1f}%"
+        lowlight_text = f"{detection.low_light_ratio:.1f}%"
         status = "废片" if detection.is_waste else "正常"
+        quality_text = f"{detection.quality_score:.1f}"
         return (
             os.path.basename(detection.path),
             status,
             issues_text,
             over_text,
             under_text,
+            highlight_text,
+            lowlight_text,
             brightness_text,
-            clip_text,
+            quality_text,
             detection.path,
         )
 
     def _get_filtered_paths(self) -> List[str]:
         ordered = list(self._result_order)
-        if not self._settings.get("realtime_filter", True):
-            return ordered
         filtered: List[str] = []
         for path in ordered:
             detection = self._all_results.get(path)
@@ -1527,35 +1474,60 @@ class WasteDetectionUI:
             else:
                 self.preview_canvas.delete("all")
                 self.detail_var.set("选择列表中的照片查看预览")
-        self._update_filter_summary(len(filtered_paths))
+        self._update_filter_summary(filtered_paths)
 
     def _apply_quality_threshold(self) -> None:
         quality_threshold = float(self._settings.get("quality_threshold", 90))
         for detection in self._all_results.values():
             detection.is_waste = detection.quality_score < quality_threshold
 
-    def _update_filter_summary(self, visible_count: Optional[int] = None) -> None:
+    def _update_filter_summary(self, filtered_paths: Optional[List[str]] = None) -> None:
+        if filtered_paths is None:
+            filtered_paths = self._get_filtered_paths()
         total = len(self._result_order)
-        if visible_count is None:
-            visible_count = len(self.tree.get_children())
         if total == 0:
             if self._running:
-                text = "筛选：检测中…"
+                text = "筛选结果：检测中…"
             else:
-                text = "筛选：暂无数据"
+                text = "筛选结果：暂无数据"
         else:
-            status = "开启" if self._settings.get("realtime_filter", True) else "关闭"
-            text = (
-                f"筛选：废片阈值≥{self._settings.get('quality_threshold', 90)}%，"
-                f"过曝≥{self._settings.get('overexposure_threshold', 85)}%，"
-                f"欠曝≥{self._settings.get('underexposure_threshold', 15)}%，"
-                f"实时筛选：{status} | 命中 {visible_count}/{total}"
-            )
+            quality_threshold = float(self._settings.get("quality_threshold", 90))
+            over_threshold = float(self._settings.get("overexposure_threshold", 85))
+            under_threshold = float(self._settings.get("underexposure_threshold", 15))
+            waste = over = under = 0
+            for path in filtered_paths:
+                detection = self._all_results.get(path)
+                if not detection:
+                    continue
+                if detection.quality_score < quality_threshold:
+                    waste += 1
+                if detection.overexposure_ratio >= over_threshold:
+                    over += 1
+                if detection.underexposure_ratio >= under_threshold:
+                    under += 1
+            text = f"筛选结果：废片 {waste} 张  过曝 {over} 张  欠曝 {under} 张"
         self.filter_summary_var.set(text)
 
-    def _on_params_change(self) -> None:
-        values = self.params_panel.get_values()
-        self._settings.update(values)
+    def _update_threshold_summary(self) -> None:
+        summary = (
+            f"检测率：{int(self.quality_var.get())}%  |  "
+            f"过曝率：{int(self.over_var.get())}%  |  "
+            f"欠曝率：{int(self.under_var.get())}%"
+        )
+        self.threshold_summary_var.set(summary)
+
+    def _on_threshold_change(self) -> None:
+        if getattr(self, "_suspend_threshold_callbacks", False):
+            self._update_threshold_summary()
+            self.over_value_var.set(f"{int(self.over_var.get())}%")
+            self.under_value_var.set(f"{int(self.under_var.get())}%")
+            return
+        self._settings["quality_threshold"] = int(self.quality_var.get())
+        self._settings["overexposure_threshold"] = int(self.over_var.get())
+        self._settings["underexposure_threshold"] = int(self.under_var.get())
+        self.over_value_var.set(f"{self._settings['overexposure_threshold']}%")
+        self.under_value_var.set(f"{self._settings['underexposure_threshold']}%")
+        self._update_threshold_summary()
         self._config["waste_detection"] = dict(self._settings)
         try:
             save_config(self._config)
@@ -1563,6 +1535,34 @@ class WasteDetectionUI:
             self._log(f"保存检测参数失败：{exc}")
         self._apply_quality_threshold()
         self._rebuild_tree(preserve_selection=True)
+
+    def _on_quality_change(self) -> None:
+        if getattr(self, "_suspend_threshold_callbacks", False):
+            self.quality_var.set(int(self.quality_var.get()))
+            self._update_threshold_summary()
+            return
+        try:
+            value = int(self.quality_var.get())
+        except Exception:
+            value = int(DEFAULT_WASTE_SETTINGS.get("quality_threshold", 90))
+        self.quality_var.set(value)
+        self._on_threshold_change()
+
+    def _on_over_scale(self, value: str) -> None:
+        try:
+            val = int(round(float(value)))
+        except Exception:
+            return
+        self.over_var.set(val)
+        self._on_threshold_change()
+
+    def _on_under_scale(self, value: str) -> None:
+        try:
+            val = int(round(float(value)))
+        except Exception:
+            return
+        self.under_var.set(val)
+        self._on_threshold_change()
 
     def _generate_unique_destination(self, dest_dir: str, filename: str) -> str:
         base, ext = os.path.splitext(filename)
@@ -1573,7 +1573,7 @@ class WasteDetectionUI:
             counter += 1
         return os.path.join(dest_dir, candidate)
 
-    def _extract_results(self, results: List[DetectionResult], copy_files: bool) -> None:
+    def _extract_results(self, results: List[DetectionResult]) -> None:
         folder = self.folder_var.get().strip()
         if not folder:
             aurora_showwarning("提示", "请先选择检测目录。", parent=self.root)
@@ -1593,28 +1593,22 @@ class WasteDetectionUI:
                 continue
             dest = self._generate_unique_destination(waste_dir, os.path.basename(src))
             try:
-                if copy_files:
-                    shutil.copy2(src, dest)
-                    action = "复制"
-                else:
-                    shutil.move(src, dest)
-                    action = "移动"
-                    removed_paths.append(src)
+                shutil.move(src, dest)
+                removed_paths.append(src)
                 moved += 1
-                self._log(f"{action}废片：{src} -> {dest}")
+                self._log(f"移动废片：{src} -> {dest}")
             except Exception as exc:
                 self._log(f"提取失败：{src} -> {exc}")
         if moved:
-            mode_text = "复制" if copy_files else "移动"
-            self._log(f"已{mode_text}{moved} 张疑似废片至 {waste_dir}")
-        if not copy_files and removed_paths:
+            self._log(f"已移动 {moved} 张疑似废片至 {waste_dir}")
+        if removed_paths:
             for path in removed_paths:
                 self._remove_detection(path, rebuild=False)
             self._rebuild_tree(preserve_selection=False)
         else:
             self._rebuild_tree()
 
-    def _ask_extract_action(self, title: str, message: str) -> Tuple[str, bool]:
+    def _confirm_extract_move(self, title: str, message: str) -> bool:
         dialog = tk.Toplevel(self.root)
         dialog.withdraw()
         dialog.title(title)
@@ -1629,47 +1623,34 @@ class WasteDetectionUI:
         ttk.Label(container, text=message, style="AuroraBody.TLabel", wraplength=460, justify="left").pack(
             anchor="w"
         )
-        copy_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            container,
-            text="保留原文件（复制而非移动）",
-            variable=copy_var,
-        ).pack(anchor="w", pady=(16, 0))
 
-        result = {"action": "cancel", "copy": False}
+        result = {"move": False}
 
-        def _set_action(action: str) -> None:
-            result["action"] = action
-            result["copy"] = bool(copy_var.get())
+        def _choose(move: bool) -> None:
+            result["move"] = move
             dialog.destroy()
 
         btn_frame = ttk.Frame(container, style="AuroraCard.TFrame")
         btn_frame.pack(anchor="e", pady=(24, 0))
         ttk.Button(
             btn_frame,
-            text="提取到‘废片’",
+            text="移动到‘废片’",
             style="AuroraPrimary.TButton",
-            command=lambda: _set_action("extract"),
+            command=lambda: _choose(True),
         ).pack(side="right")
-        ttk.Button(
-            btn_frame,
-            text="仅标记",
-            style="AuroraSecondary.TButton",
-            command=lambda: _set_action("mark"),
-        ).pack(side="right", padx=(12, 0))
         ttk.Button(
             btn_frame,
             text="取消",
             style="AuroraGhost.TButton",
-            command=lambda: _set_action("cancel"),
+            command=lambda: _choose(False),
         ).pack(side="right", padx=(12, 0))
 
-        dialog.protocol("WM_DELETE_WINDOW", lambda: _set_action("cancel"))
+        dialog.protocol("WM_DELETE_WINDOW", lambda: _choose(False))
         dialog.update_idletasks()
         center_on_parent(dialog, self.root)
         dialog.deiconify()
         dialog.wait_window()
-        return result["action"], bool(result.get("copy", False))
+        return bool(result.get("move"))
 
     def _show_completion_prompt(self) -> None:
         waste_results = [self._all_results[path] for path in self._result_order if self._all_results.get(path, None) and self._all_results[path].is_waste]
@@ -1677,38 +1658,27 @@ class WasteDetectionUI:
         if count == 0:
             aurora_showinfo("检测完成", "检测完成，未发现疑似废片。", parent=self.root)
             return
-        action, copy_flag = self._ask_extract_action(
+        if self._confirm_extract_move(
             "检测完成",
-            f"检测完成。共检测到 {count} 张疑似废片。是否将它们提取到‘废片’文件夹？",
-        )
-        if action == "extract":
-            self._extract_results(waste_results, copy_flag)
-        elif action == "mark":
-            self._log("已选择仅标记疑似废片，未执行文件操作。")
+            f"检测完成，共检测到 {count} 张废片。是否将这些照片移动到独立文件夹‘废片’以便后续筛选？",
+        ):
+            self._extract_results(waste_results)
         else:
             self._log("已取消提取疑似废片。")
 
     def _extract_filtered_to_waste(self) -> None:
-        if self._settings.get("realtime_filter", True):
-            paths = self._get_filtered_paths()
-        else:
-            paths = list(self._result_order)
+        paths = self._get_filtered_paths()
         results = [self._all_results[p] for p in paths if self._all_results.get(p)]
         if not results:
             aurora_showinfo("提示", "当前没有符合筛选条件的照片。", parent=self.root)
             return
-        action, copy_flag = self._ask_extract_action(
+        if self._confirm_extract_move(
             "提取废片",
-            f"当前筛选命中 {len(results)} 张照片。是否将它们提取到‘废片’文件夹？",
-        )
-        if action == "extract":
-            self._extract_results(results, copy_flag)
-        elif action == "mark":
-            self._log("已选择仅标记当前筛选结果，未执行文件操作。")
-
-    def _clear_filter(self) -> None:
-        self.params_panel.set_realtime_filter(False)
-        self._log("已关闭实时筛选，显示全部检测结果。")
+            f"当前筛选命中 {len(results)} 张照片。是否将它们移动到‘废片’文件夹？",
+        ):
+            self._extract_results(results)
+        else:
+            self._log("已取消提取当前筛选结果。")
 
     def _on_tree_right_click(self, event) -> None:
         try:
@@ -1726,7 +1696,7 @@ class WasteDetectionUI:
         issues_text = "、".join(detection.issues) if detection.issues else "未识别具体问题"
         status_text = "废片" if detection.is_waste else "正常"
         self._log(f"发现问题照片：{detection.path} -> {issues_text} (标记：{status_text})")
-        should_show = (not self._settings.get("realtime_filter", True)) or self._matches_filter(detection)
+        should_show = self._matches_filter(detection)
         if should_show:
             iid = self.tree.insert("", "end", values=self._tree_row_values(detection))
             self._results[iid] = detection
@@ -1827,6 +1797,7 @@ class WasteDetectionUI:
         if extra:
             detail += f"\n曝光：{'、'.join(extra)}"
         detail += f"\n过曝率：{detection.overexposure_ratio:.1f}% | 欠曝率：{detection.underexposure_ratio:.1f}%"
+        detail += f"\n高光占比：{detection.high_light_ratio:.1f}% | 低光占比：{detection.low_light_ratio:.1f}%"
         detail += f"\n标记状态：{'废片' if detection.is_waste else '正常'} | 质量分：{detection.quality_score:.1f}"
         self.detail_var.set(detail)
 
