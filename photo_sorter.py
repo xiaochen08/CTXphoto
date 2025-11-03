@@ -26,6 +26,7 @@ from types import SimpleNamespace
 
 
 
+
 from app.bootstrap_models import get_current_providers, register_session_builder, rebuild_sessions
 from app.providers import cuda_available, load_pref, pick_providers, save_pref
 
@@ -36,6 +37,12 @@ THEMES = ["暗黑"]
 DEFAULT_THEME_KEY = "dark"
 LOG_PANEL_WIDTH = 360
 COPY_BUFFER_SIZE = 4 * 1024 * 1024
+
+DEFAULT_WASTE_SETTINGS = {
+    "quality_threshold": 90,
+    "overexposure_threshold": 85,
+    "underexposure_threshold": 15,
+}
 
 DEFAULT_WASTE_SETTINGS = {
     "quality_threshold": 90,
@@ -76,6 +83,32 @@ except Exception:  # pragma: no cover - optional dependency fallback
     exifread = None
     if not SUPPRESS_RUNTIME_WARNINGS:
         print("[警告] 未检测到 exifread，将使用文件修改时间作为拍摄时间。", file=sys.stderr)
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    np = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 numpy，部分智能检测功能将受限。", file=sys.stderr)
+
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    mp = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 MediaPipe，无法启用智能闭眼检测。", file=sys.stderr)
+
+try:
+    from insightface.app import FaceAnalysis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    FaceAnalysis = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[提示] 未检测到 insightface，GPU 加速闭眼检测将不可用。", file=sys.stderr)
+
+try:
+    import onnxruntime  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    onnxruntime = None
 
 try:
     import numpy as np  # type: ignore
@@ -885,14 +918,17 @@ class WasteDetectionUI:
         self._settings["quality_threshold"] = int(self.quality_var.get())
         self._settings["overexposure_threshold"] = int(self.over_var.get())
         self._settings["underexposure_threshold"] = int(self.under_var.get())
-        self._all_results: Dict[str, DetectionResult] = {}
-        self._result_order: List[str] = []
+        self._result_map: Dict[str, DetectionResult] = {}
+        self.all_results: List[DetectionResult] = []
+        self.view_results: List[DetectionResult] = []
         self._tree_items: Dict[str, str] = {}
         self.filter_summary_var = tk.StringVar(value="筛选结果：尚未开始")
         self.threshold_summary_var = tk.StringVar(value="")
         self.over_value_var = tk.StringVar(value=f"{self.over_var.get()}%")
         self.under_value_var = tk.StringVar(value=f"{self.under_var.get()}%")
         self._suspend_threshold_callbacks = True
+        self._filter_job: Optional[str] = None
+        self._filter_preserve_selection = True
 
         self._build_ui()
         self._suspend_threshold_callbacks = False
@@ -1275,9 +1311,16 @@ class WasteDetectionUI:
 
         self._running = True
         self._stop_event.clear()
+        if self._filter_job is not None:
+            try:
+                self.frame.after_cancel(self._filter_job)
+            except Exception:
+                pass
+            self._filter_job = None
         self._results.clear()
-        self._all_results.clear()
-        self._result_order.clear()
+        self._result_map.clear()
+        self.all_results.clear()
+        self.view_results.clear()
         self._tree_items.clear()
         self.tree.delete(*self.tree.get_children())
         self.log_text.configure(state="normal")
@@ -1401,15 +1444,6 @@ class WasteDetectionUI:
         if detection.exposure_issue == "过曝" and self._over_count > 0:
             self._over_count -= 1
 
-    def _matches_filter(self, detection: DetectionResult) -> bool:
-        quality_threshold = float(self._settings.get("quality_threshold", 90))
-        over_threshold = float(self._settings.get("overexposure_threshold", 85))
-        under_threshold = float(self._settings.get("underexposure_threshold", 15))
-        waste_hit = detection.quality_score < quality_threshold
-        over_hit = detection.overexposure_ratio >= over_threshold
-        under_hit = detection.underexposure_ratio >= under_threshold
-        return waste_hit or over_hit or under_hit
-
     def _tree_row_values(self, detection: DetectionResult) -> Tuple[str, ...]:
         issues_text = "、".join(detection.issues) if detection.issues else "--"
         brightness_text = f"{detection.mean_luminance:.1f}" if detection.mean_luminance else "--"
@@ -1432,79 +1466,17 @@ class WasteDetectionUI:
             detection.path,
         )
 
-    def _get_filtered_paths(self) -> List[str]:
-        ordered = list(self._result_order)
-        filtered: List[str] = []
-        for path in ordered:
-            detection = self._all_results.get(path)
-            if detection and self._matches_filter(detection):
-                filtered.append(path)
-        return filtered
-
-    def _rebuild_tree(self, preserve_selection: bool = True) -> None:
-        if preserve_selection:
-            selection = self.tree.selection()
-            selected_path = None
-            if selection:
-                det = self._results.get(selection[0])
-                if det:
-                    selected_path = det.path
+    def _update_filter_summary(self, filtered: Optional[List[DetectionResult]] = None) -> None:
+        if filtered is None:
+            filtered = list(self.view_results)
+        if not self.all_results:
+            text = "筛选结果：检测中…" if self._running else "筛选结果：暂无数据"
         else:
-            selected_path = None
-        self.tree.delete(*self.tree.get_children())
-        self._results.clear()
-        self._tree_items.clear()
-        filtered_paths = self._get_filtered_paths()
-        for path in filtered_paths:
-            detection = self._all_results.get(path)
-            if not detection:
-                continue
-            iid = self.tree.insert("", "end", values=self._tree_row_values(detection))
-            self._results[iid] = detection
-            self._tree_items[path] = iid
-            if selected_path and path == selected_path:
-                self.tree.selection_set(iid)
-                self.tree.focus(iid)
-        if not self.tree.selection():
-            first = self.tree.get_children()
-            if first:
-                self.tree.selection_set(first[0])
-                self.tree.focus(first[0])
-                self.on_tree_select()
-            else:
-                self.preview_canvas.delete("all")
-                self.detail_var.set("选择列表中的照片查看预览")
-        self._update_filter_summary(filtered_paths)
-
-    def _apply_quality_threshold(self) -> None:
-        quality_threshold = float(self._settings.get("quality_threshold", 90))
-        for detection in self._all_results.values():
-            detection.is_waste = detection.quality_score < quality_threshold
-
-    def _update_filter_summary(self, filtered_paths: Optional[List[str]] = None) -> None:
-        if filtered_paths is None:
-            filtered_paths = self._get_filtered_paths()
-        total = len(self._result_order)
-        if total == 0:
-            if self._running:
-                text = "筛选结果：检测中…"
-            else:
-                text = "筛选结果：暂无数据"
-        else:
-            quality_threshold = float(self._settings.get("quality_threshold", 90))
             over_threshold = float(self._settings.get("overexposure_threshold", 85))
             under_threshold = float(self._settings.get("underexposure_threshold", 15))
-            waste = over = under = 0
-            for path in filtered_paths:
-                detection = self._all_results.get(path)
-                if not detection:
-                    continue
-                if detection.quality_score < quality_threshold:
-                    waste += 1
-                if detection.overexposure_ratio >= over_threshold:
-                    over += 1
-                if detection.underexposure_ratio >= under_threshold:
-                    under += 1
+            waste = len(filtered)
+            over = sum(1 for det in filtered if det.overexposure_ratio >= over_threshold)
+            under = sum(1 for det in filtered if det.underexposure_ratio >= under_threshold)
             text = f"筛选结果：废片 {waste} 张  过曝 {over} 张  欠曝 {under} 张"
         self.filter_summary_var.set(text)
 
@@ -1516,7 +1488,81 @@ class WasteDetectionUI:
         )
         self.threshold_summary_var.set(summary)
 
-    def _on_threshold_change(self) -> None:
+    def _persist_settings(self) -> None:
+        self._config["waste_detection"] = dict(self._settings)
+        try:
+            save_config(self._config)
+        except Exception as exc:
+            self._log(f"保存检测参数失败：{exc}")
+
+    def _schedule_filter_refresh(self, preserve_selection: bool = True) -> None:
+        if self._filter_job is not None:
+            try:
+                self.frame.after_cancel(self._filter_job)
+            except Exception:
+                pass
+        self._filter_preserve_selection = preserve_selection
+        self._filter_job = self.frame.after(150, self._run_filter_job)
+
+    def _run_filter_job(self) -> None:
+        self._filter_job = None
+        self._apply_filters(preserve_selection=self._filter_preserve_selection)
+
+    def _apply_filters(self, preserve_selection: bool = True) -> None:
+        thr_quality = float(self._settings.get("quality_threshold", 90))
+        thr_over = float(self._settings.get("overexposure_threshold", 85))
+        thr_under = float(self._settings.get("underexposure_threshold", 15))
+        filtered: List[DetectionResult] = []
+        for detection in self.all_results:
+            eye_hit = bool(
+                detection.closed_eye_count
+                or detection.partial_eye_count
+                or detection.abnormal_eye_count
+                or detection.issues
+            )
+            quality_hit = detection.quality_score < thr_quality
+            over_hit = detection.overexposure_ratio >= thr_over
+            under_hit = detection.underexposure_ratio >= thr_under
+            detection.is_waste = bool(eye_hit or quality_hit or over_hit or under_hit)
+            if detection.is_waste:
+                filtered.append(detection)
+        self.view_results = filtered
+        self._reload_treeview(filtered, preserve_selection=preserve_selection)
+        self._update_filter_summary(filtered)
+
+    def _reload_treeview(self, rows: List[DetectionResult], preserve_selection: bool = True) -> None:
+        selected_path = None
+        if preserve_selection:
+            current_selection = self.tree.selection()
+            if current_selection:
+                det = self._results.get(current_selection[0])
+                if det:
+                    selected_path = det.path
+        self.tree.delete(*self.tree.get_children())
+        self._results.clear()
+        self._tree_items.clear()
+        for detection in rows:
+            iid = self.tree.insert("", "end", values=self._tree_row_values(detection))
+            self._results[iid] = detection
+            self._tree_items[detection.path] = iid
+            if selected_path and detection.path == selected_path:
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+        if self.tree.selection():
+            self.on_tree_select()
+            return
+        if rows:
+            children = self.tree.get_children()
+            if children:
+                first = children[0]
+                self.tree.selection_set(first)
+                self.tree.focus(first)
+                self.on_tree_select()
+        else:
+            self.preview_canvas.delete("all")
+            self.detail_var.set("选择列表中的照片查看预览")
+
+    def _on_filter_change(self) -> None:
         if getattr(self, "_suspend_threshold_callbacks", False):
             self._update_threshold_summary()
             self.over_value_var.set(f"{int(self.over_var.get())}%")
@@ -1525,28 +1571,22 @@ class WasteDetectionUI:
         self._settings["quality_threshold"] = int(self.quality_var.get())
         self._settings["overexposure_threshold"] = int(self.over_var.get())
         self._settings["underexposure_threshold"] = int(self.under_var.get())
-        self.over_value_var.set(f"{self._settings['overexposure_threshold']}%")
-        self.under_value_var.set(f"{self._settings['underexposure_threshold']}%")
+        self.over_value_var.set(f"{self.over_var.get()}%")
+        self.under_value_var.set(f"{self.under_var.get()}%")
         self._update_threshold_summary()
-        self._config["waste_detection"] = dict(self._settings)
-        try:
-            save_config(self._config)
-        except Exception as exc:
-            self._log(f"保存检测参数失败：{exc}")
-        self._apply_quality_threshold()
-        self._rebuild_tree(preserve_selection=True)
+        self._persist_settings()
+        self._schedule_filter_refresh()
 
     def _on_quality_change(self) -> None:
         if getattr(self, "_suspend_threshold_callbacks", False):
-            self.quality_var.set(int(self.quality_var.get()))
             self._update_threshold_summary()
             return
         try:
             value = int(self.quality_var.get())
         except Exception:
             value = int(DEFAULT_WASTE_SETTINGS.get("quality_threshold", 90))
-        self.quality_var.set(value)
-        self._on_threshold_change()
+            self.quality_var.set(value)
+        self._on_filter_change()
 
     def _on_over_scale(self, value: str) -> None:
         try:
@@ -1554,7 +1594,8 @@ class WasteDetectionUI:
         except Exception:
             return
         self.over_var.set(val)
-        self._on_threshold_change()
+        self.over_value_var.set(f"{val}%")
+        self._on_filter_change()
 
     def _on_under_scale(self, value: str) -> None:
         try:
@@ -1562,7 +1603,8 @@ class WasteDetectionUI:
         except Exception:
             return
         self.under_var.set(val)
-        self._on_threshold_change()
+        self.under_value_var.set(f"{val}%")
+        self._on_filter_change()
 
     def _generate_unique_destination(self, dest_dir: str, filename: str) -> str:
         base, ext = os.path.splitext(filename)
@@ -1603,10 +1645,10 @@ class WasteDetectionUI:
             self._log(f"已移动 {moved} 张疑似废片至 {waste_dir}")
         if removed_paths:
             for path in removed_paths:
-                self._remove_detection(path, rebuild=False)
-            self._rebuild_tree(preserve_selection=False)
+                self._remove_detection(path, reapply=False)
+            self._apply_filters(preserve_selection=False)
         else:
-            self._rebuild_tree()
+            self._apply_filters()
 
     def _confirm_extract_move(self, title: str, message: str) -> bool:
         dialog = tk.Toplevel(self.root)
@@ -1653,7 +1695,7 @@ class WasteDetectionUI:
         return bool(result.get("move"))
 
     def _show_completion_prompt(self) -> None:
-        waste_results = [self._all_results[path] for path in self._result_order if self._all_results.get(path, None) and self._all_results[path].is_waste]
+        waste_results = [det for det in self.all_results if det.is_waste]
         count = len(waste_results)
         if count == 0:
             aurora_showinfo("检测完成", "检测完成，未发现疑似废片。", parent=self.root)
@@ -1667,8 +1709,7 @@ class WasteDetectionUI:
             self._log("已取消提取疑似废片。")
 
     def _extract_filtered_to_waste(self) -> None:
-        paths = self._get_filtered_paths()
-        results = [self._all_results[p] for p in paths if self._all_results.get(p)]
+        results = list(self.view_results)
         if not results:
             aurora_showinfo("提示", "当前没有符合筛选条件的照片。", parent=self.root)
             return
@@ -1689,54 +1730,57 @@ class WasteDetectionUI:
     def _handle_detection(self, detection: DetectionResult) -> None:
         self._evaluate_detection(detection)
         path = detection.path
-        if path not in self._all_results:
-            self._result_order.append(path)
-        self._all_results[path] = detection
+        replaced = False
+        for idx, existing in enumerate(self.all_results):
+            if existing.path == path:
+                self.all_results[idx] = detection
+                replaced = True
+                break
+        if not replaced:
+            self.all_results.append(detection)
+        self._result_map[path] = detection
         self._increment_counters(detection)
+        thr_quality = float(self._settings.get("quality_threshold", 90))
+        thr_over = float(self._settings.get("overexposure_threshold", 85))
+        thr_under = float(self._settings.get("underexposure_threshold", 15))
+        eye_hit = bool(
+            detection.closed_eye_count
+            or detection.partial_eye_count
+            or detection.abnormal_eye_count
+            or detection.issues
+        )
+        quality_hit = detection.quality_score < thr_quality
+        over_hit = detection.overexposure_ratio >= thr_over
+        under_hit = detection.underexposure_ratio >= thr_under
+        detection.is_waste = bool(eye_hit or quality_hit or over_hit or under_hit)
         issues_text = "、".join(detection.issues) if detection.issues else "未识别具体问题"
         status_text = "废片" if detection.is_waste else "正常"
         self._log(f"发现问题照片：{detection.path} -> {issues_text} (标记：{status_text})")
-        should_show = self._matches_filter(detection)
-        if should_show:
-            iid = self.tree.insert("", "end", values=self._tree_row_values(detection))
-            self._results[iid] = detection
-            self._tree_items[path] = iid
-            if not self.tree.selection():
-                self.tree.selection_set(iid)
-                self.tree.focus(iid)
-                self.on_tree_select()
+        self._apply_filters(preserve_selection=True)
         self._update_summary()
-        self._update_filter_summary()
 
-    def _remove_detection(self, path: str, rebuild: bool = True) -> None:
+    def _remove_detection(self, path: str, reapply: bool = True) -> None:
         detection = None
-        stored_path = None
-        if path in self._all_results:
-            detection = self._all_results.pop(path)
-            stored_path = path
-        else:
-            for p, det in list(self._all_results.items()):
-                if det.path == path:
-                    detection = self._all_results.pop(p)
-                    stored_path = p
-                    break
-        if stored_path is not None:
-            self._tree_items.pop(stored_path, None)
-            self._result_order = [p for p in self._result_order if p != stored_path]
-        if detection is None:
-            for iid, det in list(self._results.items()):
-                if det.path == path:
-                    detection = det
-                    self._results.pop(iid, None)
-        else:
-            for iid, det in list(self._results.items()):
-                if det.path == detection.path:
-                    self._results.pop(iid, None)
+        for idx, det in enumerate(list(self.all_results)):
+            if det.path == path:
+                detection = det
+                del self.all_results[idx]
+                break
+        self._result_map.pop(path, None)
+        self.view_results = [det for det in self.view_results if det.path != path]
+        iid = self._tree_items.pop(path, None)
+        if iid:
+            self._results.pop(iid, None)
+            if not reapply:
+                try:
+                    self.tree.delete(iid)
+                except Exception:
+                    pass
         if detection:
             self._deduct_counters(detection)
         self._update_summary()
-        if rebuild:
-            self._rebuild_tree(preserve_selection=False)
+        if reapply:
+            self._apply_filters(preserve_selection=False)
 
     def on_tree_select(self, _event=None) -> None:
         selection = self.tree.selection()
