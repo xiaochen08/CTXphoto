@@ -27,6 +27,7 @@ from types import SimpleNamespace
 
 
 
+
 from app.bootstrap_models import get_current_providers, register_session_builder, rebuild_sessions
 from app.providers import cuda_available, load_pref, pick_providers, save_pref
 
@@ -37,6 +38,12 @@ THEMES = ["暗黑"]
 DEFAULT_THEME_KEY = "dark"
 LOG_PANEL_WIDTH = 360
 COPY_BUFFER_SIZE = 4 * 1024 * 1024
+
+DEFAULT_WASTE_SETTINGS = {
+    "quality_threshold": 90,
+    "overexposure_threshold": 85,
+    "underexposure_threshold": 15,
+}
 
 DEFAULT_WASTE_SETTINGS = {
     "quality_threshold": 90,
@@ -83,6 +90,32 @@ except Exception:  # pragma: no cover - optional dependency fallback
     exifread = None
     if not SUPPRESS_RUNTIME_WARNINGS:
         print("[警告] 未检测到 exifread，将使用文件修改时间作为拍摄时间。", file=sys.stderr)
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    np = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 numpy，部分智能检测功能将受限。", file=sys.stderr)
+
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    mp = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 MediaPipe，无法启用智能闭眼检测。", file=sys.stderr)
+
+try:
+    from insightface.app import FaceAnalysis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    FaceAnalysis = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[提示] 未检测到 insightface，GPU 加速闭眼检测将不可用。", file=sys.stderr)
+
+try:
+    import onnxruntime  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    onnxruntime = None
 
 try:
     import numpy as np  # type: ignore
@@ -929,6 +962,7 @@ class WasteDetectionUI:
         self._suspend_threshold_callbacks = True
         self._filter_job: Optional[str] = None
         self._filter_preserve_selection = True
+        self._filter_pending = False
 
         self._build_ui()
         self._suspend_threshold_callbacks = False
@@ -1317,6 +1351,8 @@ class WasteDetectionUI:
             except Exception:
                 pass
             self._filter_job = None
+        self._filter_pending = False
+        self._filter_preserve_selection = True
         self._results.clear()
         self._result_map.clear()
         self.all_results.clear()
@@ -1496,17 +1532,20 @@ class WasteDetectionUI:
             self._log(f"保存检测参数失败：{exc}")
 
     def _schedule_filter_refresh(self, preserve_selection: bool = True) -> None:
-        if self._filter_job is not None:
-            try:
-                self.frame.after_cancel(self._filter_job)
-            except Exception:
-                pass
-        self._filter_preserve_selection = preserve_selection
-        self._filter_job = self.frame.after(150, self._run_filter_job)
+        if not preserve_selection:
+            self._filter_preserve_selection = False
+        self._filter_pending = True
+        if self._filter_job is None:
+            self._filter_job = self.frame.after(120, self._run_filter_job)
 
     def _run_filter_job(self) -> None:
         self._filter_job = None
-        self._apply_filters(preserve_selection=self._filter_preserve_selection)
+        self._filter_pending = False
+        preserve_selection = self._filter_preserve_selection
+        self._filter_preserve_selection = True
+        self._apply_filters(preserve_selection=preserve_selection)
+        if self._filter_pending and self._filter_job is None:
+            self._filter_job = self.frame.after(120, self._run_filter_job)
 
     def _apply_filters(self, preserve_selection: bool = True) -> None:
         thr_quality = float(self._settings.get("quality_threshold", 90))
