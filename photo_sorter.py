@@ -23,6 +23,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from types import SimpleNamespace
 
 
+
+
+
+
+from app.bootstrap_models import get_current_providers, register_session_builder, rebuild_sessions
+from app.providers import cuda_available, load_pref, pick_providers, save_pref
+
 VERSION = "v1.7.8"
 CONFIG_FILE = "photo_sorter_config.json"
 CATEGORIES = ["婚礼", "写真", "日常记录", "旅游记录", "商业活动拍摄"]
@@ -35,6 +42,19 @@ DEFAULT_WASTE_SETTINGS = {
     "quality_threshold": 90,
     "overexposure_threshold": 85,
     "underexposure_threshold": 15,
+}
+
+DEFAULT_WASTE_SETTINGS = {
+    "quality_threshold": 90,
+    "overexposure_threshold": 85,
+    "underexposure_threshold": 15,
+}
+
+DEFAULT_WASTE_SETTINGS = {
+    "quality_threshold": 90,
+    "overexposure_threshold": 85,
+    "underexposure_threshold": 15,
+    "realtime_filter": True,
 }
 
 SUPPRESS_RUNTIME_WARNINGS = any(arg in ("-h", "--help") for arg in sys.argv[1:])
@@ -63,6 +83,162 @@ except Exception:  # pragma: no cover - optional dependency fallback
     exifread = None
     if not SUPPRESS_RUNTIME_WARNINGS:
         print("[警告] 未检测到 exifread，将使用文件修改时间作为拍摄时间。", file=sys.stderr)
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    np = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 numpy，部分智能检测功能将受限。", file=sys.stderr)
+
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    mp = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 MediaPipe，无法启用智能闭眼检测。", file=sys.stderr)
+
+try:
+    from insightface.app import FaceAnalysis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    FaceAnalysis = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[提示] 未检测到 insightface，GPU 加速闭眼检测将不可用。", file=sys.stderr)
+
+try:
+    import onnxruntime  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    onnxruntime = None
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    np = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 numpy，部分智能检测功能将受限。", file=sys.stderr)
+
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    mp = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 MediaPipe，无法启用智能闭眼检测。", file=sys.stderr)
+
+try:
+    from insightface.app import FaceAnalysis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    FaceAnalysis = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[提示] 未检测到 insightface，GPU 加速闭眼检测将不可用。", file=sys.stderr)
+
+try:
+    import onnxruntime  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    onnxruntime = None
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    np = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 numpy，部分智能检测功能将受限。", file=sys.stderr)
+
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    mp = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 MediaPipe，无法启用智能闭眼检测。", file=sys.stderr)
+
+try:
+    from insightface.app import FaceAnalysis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    FaceAnalysis = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[提示] 未检测到 insightface，GPU 加速闭眼检测将不可用。", file=sys.stderr)
+
+try:
+    import onnxruntime  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    onnxruntime = None
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    np = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 numpy，部分智能检测功能将受限。", file=sys.stderr)
+
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    mp = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 MediaPipe，无法启用智能闭眼检测。", file=sys.stderr)
+
+try:
+    from insightface.app import FaceAnalysis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    FaceAnalysis = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[提示] 未检测到 insightface，GPU 加速闭眼检测将不可用。", file=sys.stderr)
+
+try:
+    import onnxruntime  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    onnxruntime = None
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    np = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 numpy，部分智能检测功能将受限。", file=sys.stderr)
+
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    mp = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 MediaPipe，无法启用智能闭眼检测。", file=sys.stderr)
+
+try:
+    from insightface.app import FaceAnalysis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    FaceAnalysis = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[提示] 未检测到 insightface，GPU 加速闭眼检测将不可用。", file=sys.stderr)
+
+try:
+    import onnxruntime  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    onnxruntime = None
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    np = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 numpy，部分智能检测功能将受限。", file=sys.stderr)
+
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    mp = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 MediaPipe，无法启用智能闭眼检测。", file=sys.stderr)
+
+try:
+    from insightface.app import FaceAnalysis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    FaceAnalysis = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[提示] 未检测到 insightface，GPU 加速闭眼检测将不可用。", file=sys.stderr)
+
+try:
+    import onnxruntime  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    onnxruntime = None
 
 try:
     import numpy as np  # type: ignore
@@ -2597,6 +2773,527 @@ def aurora_askretrycancel(title, message, parent=None):
         )
     )
 
+
+class WasteDetectionView:
+    """Secondary UI for closed-eye & exposure detection."""
+
+    def __init__(self, parent, root, theme_key, on_back):
+        self.parent = parent
+        self.root = root
+        self.theme_key = theme_key
+        self.on_back = on_back
+        self.frame = ttk.Frame(parent, style="AuroraPanel.TFrame")
+        self.frame.grid_rowconfigure(0, weight=1)
+        self.frame.grid_columnconfigure(0, weight=1)
+
+        self.folder_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="待机")
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_text_var = tk.StringVar(value="0 / 0")
+        self.preview_message_var = tk.StringVar(value="选择结果后显示预览")
+
+        self._queue = queue.Queue()
+        self._thread = None
+        self._cancel_event = threading.Event()
+        self._analyzer = None
+        self._results = []
+        self._result_by_item = {}
+        self._current_folder = None
+        self._preview_image = None
+
+        self._build_ui()
+        self.apply_theme(theme_key)
+
+    # ---------- UI Building ----------
+    def _build_ui(self):
+        container = ttk.Frame(self.frame, style="AuroraPanel.TFrame")
+        container.grid(row=0, column=0, sticky="nsew", padx=36, pady=(0, 28))
+        container.grid_rowconfigure(1, weight=1)
+        container.grid_columnconfigure(0, weight=3)
+        container.grid_columnconfigure(1, weight=2)
+
+        # Controls card
+        control_card = ttk.Frame(container, style="AuroraCard.TFrame", padding=(28, 26))
+        control_card.grid(row=0, column=0, columnspan=2, sticky="ew")
+        control_card.grid_columnconfigure(1, weight=1)
+        ttk.Label(control_card, text="闭眼/曝光检测", style="AuroraSection.TLabel").grid(
+            row=0, column=0, sticky="w", columnspan=3
+        )
+
+        ttk.Label(control_card, text="检测目录", style="AuroraBody.TLabel").grid(
+            row=1, column=0, sticky="e", padx=(0, 12), pady=(14, 0)
+        )
+        entry = ttk.Entry(control_card, textvariable=self.folder_var, width=60, style="Aurora.TEntry")
+        entry.grid(row=1, column=1, sticky="ew", pady=(14, 0))
+        ttk.Button(
+            control_card,
+            text="浏览",
+            style="AuroraGhost.TButton",
+            command=self._choose_folder,
+        ).grid(row=1, column=2, padx=(14, 0), pady=(14, 0))
+
+        self.start_btn = ttk.Button(
+            control_card,
+            text="开始检测",
+            style="AuroraPrimary.TButton",
+            command=self._start_detection,
+        )
+        self.start_btn.grid(row=2, column=0, sticky="w", pady=(18, 0))
+
+        self.stop_btn = ttk.Button(
+            control_card,
+            text="停止",
+            style="AuroraDanger.TButton",
+            command=self._stop_detection,
+            state="disabled",
+        )
+        self.stop_btn.grid(row=2, column=1, sticky="w", padx=(18, 0), pady=(18, 0))
+
+        ttk.Button(
+            control_card,
+            text="返回导入界面",
+            style="AuroraGhost.TButton",
+            command=self._back_to_import,
+        ).grid(row=2, column=2, sticky="e", pady=(18, 0))
+
+        progress = ttk.Progressbar(
+            control_card,
+            mode="determinate",
+            maximum=100,
+            variable=self.progress_var,
+            style="Aurora.Horizontal.TProgressbar",
+        )
+        progress.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(22, 0))
+        ttk.Label(control_card, textvariable=self.progress_text_var, style="AuroraStatus.TLabel").grid(
+            row=3, column=2, sticky="e", pady=(22, 0)
+        )
+        ttk.Label(control_card, textvariable=self.status_var, style="AuroraStatus.TLabel").grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(16, 0)
+        )
+
+        # Results card
+        results_card = ttk.Frame(container, style="AuroraCard.TFrame", padding=(28, 24))
+        results_card.grid(row=1, column=0, sticky="nsew", pady=(20, 0))
+        results_card.grid_rowconfigure(1, weight=1)
+        results_card.grid_columnconfigure(0, weight=1)
+        ttk.Label(results_card, text="检测结果", style="AuroraSection.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+
+        columns = ("file", "eyes", "exposure", "confidence")
+        self.tree = ttk.Treeview(
+            results_card,
+            columns=columns,
+            show="headings",
+            height=10,
+        )
+        self.tree.heading("file", text="文件")
+        self.tree.heading("eyes", text="眼部异常")
+        self.tree.heading("exposure", text="曝光")
+        self.tree.heading("confidence", text="置信度")
+        self.tree.column("file", width=260, anchor="w")
+        self.tree.column("eyes", width=160, anchor="w")
+        self.tree.column("exposure", width=100, anchor="center")
+        self.tree.column("confidence", width=90, anchor="center")
+        self.tree.grid(row=1, column=0, sticky="nsew", pady=(18, 0))
+
+        vsb = ttk.Scrollbar(results_card, orient="vertical", command=self.tree.yview, style="Aurora.Vertical.TScrollbar")
+        vsb.grid(row=1, column=1, sticky="ns", padx=(16, 0), pady=(18, 0))
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.tag_configure("eyes", foreground="#F87171")
+        self.tree.tag_configure("exposure", foreground="#F97316")
+
+        btn_row = ttk.Frame(results_card, style="AuroraCard.TFrame")
+        btn_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        btn_row.columnconfigure(0, weight=1)
+        btn_row.columnconfigure(1, weight=0)
+        btn_row.columnconfigure(2, weight=0)
+
+        self.delete_btn = ttk.Button(
+            btn_row,
+            text="删除选中", style="AuroraDanger.TButton", command=self._delete_selected, state="disabled"
+        )
+        self.delete_btn.grid(row=0, column=2, padx=(16, 0))
+
+        ttk.Button(
+            btn_row,
+            text="打开所在文件夹",
+            style="AuroraPrimary.TButton",
+            command=self._open_selected_folder,
+        ).grid(row=0, column=1, padx=(16, 0))
+
+        self.open_file_btn = ttk.Button(
+            btn_row,
+            text="预览原图",
+            style="AuroraPrimary.TButton",
+            command=self._open_original,
+            state="disabled",
+        )
+        self.open_file_btn.grid(row=0, column=0, sticky="w")
+
+        # Preview card
+        preview_card = ttk.Frame(container, style="AuroraCard.TFrame", padding=(28, 24))
+        preview_card.grid(row=1, column=1, sticky="nsew", padx=(20, 0), pady=(20, 0))
+        preview_card.grid_rowconfigure(1, weight=1)
+        preview_card.grid_columnconfigure(0, weight=1)
+        ttk.Label(preview_card, text="预览", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w")
+
+        self.preview_canvas = tk.Canvas(
+            preview_card,
+            width=420,
+            height=320,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.preview_canvas.grid(row=1, column=0, sticky="nsew", pady=(18, 0))
+
+        ttk.Label(preview_card, textvariable=self.preview_message_var, style="AuroraStatus.TLabel").grid(
+            row=2, column=0, sticky="w", pady=(16, 0)
+        )
+
+        # Info/instructions card
+        info_card = ttk.Frame(container, style="AuroraCard.TFrame", padding=(28, 24))
+        info_card.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(20, 0))
+        info_card.grid_rowconfigure(1, weight=1)
+        info_card.grid_columnconfigure(0, weight=1)
+        ttk.Label(info_card, text="建议与说明", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w")
+
+        self.info_box = tk.Text(info_card, height=6, wrap="word", bd=0, relief="flat", state="normal")
+        self.info_box.insert(
+            "end",
+            "• 仅对选中目录内的 JPG/JPEG 文件进行检测，且不会自动删除；删除操作需人工确认。\n"
+            "• 推荐在电脑硬盘路径运行，不要直接在存储卡上操作，本界面会阻止对移动介质执行批量删除。\n"
+            "• 初次使用请安装依赖：pip install mediapipe==0.10.9 opencv-python onnxruntime numpy pillow。\n"
+            "• 若电脑具备 NVIDIA GPU，可执行 pip install onnxruntime-gpu insightface，并在 ~/.insightface/models/ 目录放置 antelopev2 模型。\n"
+            "  模型下载：https://github.com/deepinsight/insightface/releases/download/antelopev2/antelopev2.zip，解压后保持子目录结构。\n"
+            "• 也可使用 CPU 版本（pip install onnxruntime insightface），识别速度较慢但占用低；本界面默认自动检测 mediapipe 并支持 GPU/CPU 回退。\n"
+            "• 欠曝/过曝判定依据平均亮度与高低光比例，可在检测后通过预览红框确认眼部区域。\n"
+        )
+        self.info_box.configure(state="disabled")
+        self.info_box.grid(row=1, column=0, sticky="nsew", pady=(16, 0))
+
+        info_sb = ttk.Scrollbar(info_card, orient="vertical", command=self.info_box.yview, style="Aurora.Vertical.TScrollbar")
+        info_sb.grid(row=1, column=1, sticky="ns", pady=(16, 0))
+        self.info_box.configure(yscrollcommand=info_sb.set)
+
+        self.log_box = tk.Text(info_card, height=6, wrap="word", bd=0, relief="flat", state="disabled")
+        self.log_box.grid(row=2, column=0, sticky="nsew", pady=(18, 0))
+        info_card.grid_rowconfigure(2, weight=1)
+        log_sb = ttk.Scrollbar(info_card, orient="vertical", command=self.log_box.yview, style="Aurora.Vertical.TScrollbar")
+        log_sb.grid(row=2, column=1, sticky="ns", pady=(18, 0))
+        self.log_box.configure(yscrollcommand=log_sb.set)
+
+    # ---------- Theme & Utility ----------
+    def apply_theme(self, theme_key):
+        self.theme_key = theme_key
+        if hasattr(self, "info_box"):
+            set_text_theme(self.info_box, theme_key)
+        if hasattr(self, "log_box"):
+            set_text_theme(self.log_box, theme_key)
+        if self.preview_canvas is not None:
+            bg = AURORA_THEME["CARD_HIGHLIGHT"]
+            self.preview_canvas.configure(background=bg)
+
+    def show(self):
+        self.frame.tkraise()
+        self.status_var.set("待机")
+        self._append_log("已进入闭眼检测界面")
+
+    def _append_log(self, line: str):
+        log_add(self.log_box, line)
+
+    def _choose_folder(self):
+        initial = self.folder_var.get() or os.path.expanduser("~")
+        folder = filedialog.askdirectory(title="选择需要检测的硬盘目录", initialdir=initial)
+        if folder:
+            if self._is_removable_drive(folder):
+                aurora_showwarning("提示", "检测目标必须位于电脑硬盘，请先复制到硬盘后再进行检测。", parent=self.root)
+                return
+            self.folder_var.set(folder)
+            self._current_folder = folder
+            self._append_log(f"选定目录：{folder}")
+
+    def _is_removable_drive(self, path: str) -> bool:
+        if os.name == "nt":
+            drive, _ = os.path.splitdrive(os.path.abspath(path))
+            if drive:
+                code = get_drive_type_code(drive)
+                return code == 2
+        return False
+
+    def _set_running(self, running: bool):
+        set_button_state(self.start_btn, active=not running)
+        set_button_state(self.stop_btn, active=running, style_active="AuroraDanger.TButton")
+        if running:
+            self.stop_btn.config(state="normal")
+        else:
+            self.stop_btn.config(state="disabled")
+
+    def _start_detection(self):
+        if self._thread and self._thread.is_alive():
+            return
+        folder = self.folder_var.get().strip()
+        if not folder:
+            aurora_showwarning("提示", "请先选择需要检测的目录。", parent=self.root)
+            return
+        if not os.path.isdir(folder):
+            aurora_showwarning("提示", "目录不存在，请重新选择。", parent=self.root)
+            return
+        if self._is_removable_drive(folder):
+            aurora_showwarning("提示", "请勿直接在存储卡上操作，请复制到硬盘后再检测。", parent=self.root)
+            return
+
+        try:
+            self._analyzer = PhotoQualityAnalyzer()
+        except AnalyzerUnavailableError as exc:
+            aurora_showwarning("缺少依赖", str(exc), parent=self.root)
+            return
+        except Exception as exc:
+            aurora_showwarning("初始化失败", f"初始化检测模型失败：{exc}", parent=self.root)
+            return
+
+        self._results.clear()
+        self._result_by_item.clear()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self._preview_image = None
+        self.preview_canvas.delete("all")
+        self.preview_message_var.set("检测进行中…")
+        self.progress_var.set(0.0)
+        self.progress_text_var.set("0 / 0")
+        self.status_var.set("正在初始化检测…")
+        self._append_log("开始检测闭眼/曝光问题…")
+
+        self._queue = queue.Queue()
+        self._cancel_event.clear()
+        self._set_running(True)
+
+        def worker():
+            total_flagged = 0
+            try:
+                def progress_cb(idx, total, path, analysis):
+                    if self._cancel_event.is_set():
+                        return
+                    self._queue.put(("progress", idx, total))
+                    if analysis is not None and analysis.has_issue:
+                        self._queue.put(("issue", analysis))
+
+                results = self._analyzer.analyze_folder(
+                    folder,
+                    include_normal=False,
+                    cancel_event=self._cancel_event,
+                    progress_cb=progress_cb,
+                )
+                total_flagged = len(results)
+                if self._cancel_event.is_set():
+                    self._queue.put(("cancelled",))
+                else:
+                    self._queue.put(("done", total_flagged))
+            except Exception as exc:
+                self._queue.put(("error", str(exc)))
+            finally:
+                try:
+                    if self._analyzer:
+                        self._analyzer.close()
+                except Exception:
+                    pass
+
+        self._thread = threading.Thread(target=worker, daemon=True)
+        self._thread.start()
+        self._pump_queue()
+
+    def _pump_queue(self):
+        try:
+            while True:
+                item = self._queue.get_nowait()
+                kind = item[0]
+                if kind == "progress":
+                    _, idx, total = item
+                    if total:
+                        self.progress_var.set(max(0.0, min(100.0, idx / total * 100)))
+                        self.progress_text_var.set(f"{idx} / {total}")
+                    self.status_var.set(f"检测中…({idx}/{total})")
+                elif kind == "issue":
+                    analysis = item[1]
+                    self._add_result(analysis)
+                elif kind == "done":
+                    flagged = item[1]
+                    self.status_var.set(f"检测完成，发现 {flagged} 张异常照片")
+                    self._append_log(f"检测完成，共发现 {flagged} 张可能需要关注的照片。")
+                    if flagged:
+                        self._ask_delete_all()
+                    self._set_running(False)
+                    self.preview_message_var.set("选择结果查看预览")
+                elif kind == "cancelled":
+                    self.status_var.set("已取消")
+                    self.preview_message_var.set("检测已取消")
+                    self._append_log("用户取消检测")
+                    self._set_running(False)
+                elif kind == "error":
+                    msg = item[1]
+                    self.status_var.set("检测失败")
+                    self.preview_message_var.set("检测失败")
+                    self._append_log(f"检测失败：{msg}")
+                    aurora_showwarning("检测失败", msg, parent=self.root)
+                    self._set_running(False)
+        except queue.Empty:
+            pass
+        if self._thread and self._thread.is_alive():
+            self.frame.after(120, self._pump_queue)
+
+    def _add_result(self, analysis: PhotoQualityResult):
+        self._results.append(analysis)
+        tags = []
+        if analysis.eye_issues:
+            tags.append("eyes")
+        if analysis.exposure_issue and analysis.exposure_issue.status != "正常":
+            tags.append("exposure")
+        eye_conf = max((issue.confidence for issue in analysis.eye_issues), default=0.0)
+        expo_conf = analysis.exposure_issue.confidence if analysis.exposure_issue else 0.0
+        conf_text = f"眼{eye_conf:.2f}/光{expo_conf:.2f}" if (eye_conf or expo_conf) else "--"
+        item = self.tree.insert(
+            "",
+            "end",
+            values=(analysis.rel_path, analysis.closed_eye_summary, analysis.exposure_issue.status if analysis.exposure_issue else "--", conf_text),
+            tags=tags,
+        )
+        self._result_by_item[item] = analysis
+        self.delete_btn.config(state="normal")
+
+    def _stop_detection(self):
+        if self._thread and self._thread.is_alive():
+            self._cancel_event.set()
+            self.status_var.set("取消中…")
+            self._append_log("正在取消检测…")
+
+    def _on_select(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            self.preview_canvas.delete("all")
+            self.preview_message_var.set("选择结果后显示预览")
+            self.open_file_btn.config(state="disabled")
+            return
+        item = sel[0]
+        analysis = self._result_by_item.get(item)
+        if analysis is None:
+            return
+        self.open_file_btn.config(state="normal")
+        self.preview_message_var.set(f"{analysis.rel_path}")
+        self._render_preview(analysis)
+
+    def _render_preview(self, analysis: PhotoQualityResult):
+        self.preview_canvas.delete("all")
+        if Image is None or ImageDraw is None or ImageTk is None:
+            self.preview_message_var.set("需要安装 Pillow 才能预览")
+            return
+        try:
+            image = Image.open(analysis.path)
+        except Exception as exc:
+            self.preview_message_var.set(f"无法打开图片：{exc}")
+            return
+        image = image.convert("RGB")
+        draw = ImageDraw.Draw(image)
+        scale = max(1, image.width // 450)
+        for issue in analysis.eye_issues:
+            draw.rectangle(issue.bbox, outline=(255, 80, 80), width=scale)
+            draw.text((issue.bbox[0] + 4, issue.bbox[1] + 4), issue.status, fill=(255, 80, 80))
+        if analysis.exposure_issue and analysis.exposure_issue.status != "正常":
+            draw.rectangle((12, 12, 12 + 220, 60), outline=(255, 208, 0), width=scale)
+            draw.text((20, 20), f"曝光：{analysis.exposure_issue.status}", fill=(255, 208, 0))
+        preview = ImageOps.contain(image, (420, 320)) if ImageOps else image
+        self._preview_image = ImageTk.PhotoImage(preview)
+        self.preview_canvas.create_image(210, 160, image=self._preview_image)
+
+    def _open_original(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        analysis = self._result_by_item.get(sel[0])
+        if analysis:
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile(analysis.path)
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", analysis.path])
+                else:
+                    subprocess.Popen(["xdg-open", analysis.path])
+            except Exception as exc:
+                aurora_showwarning("打开失败", f"无法打开文件：{exc}", parent=self.root)
+
+    def _open_selected_folder(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        analysis = self._result_by_item.get(sel[0])
+        if not analysis:
+            return
+        folder = os.path.dirname(analysis.path)
+        if not folder:
+            return
+        _open_folder(folder)
+
+    def _delete_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        paths = []
+        for item in sel:
+            analysis = self._result_by_item.get(item)
+            if analysis:
+                paths.append(analysis.path)
+        if not paths:
+            return
+        if not aurora_askyesno("删除确认", f"确认删除选中的 {len(paths)} 张照片？操作不可撤销。", parent=self.root):
+            return
+        removed = 0
+        for item in list(sel):
+            analysis = self._result_by_item.get(item)
+            if not analysis:
+                continue
+            try:
+                if os.path.isfile(analysis.path):
+                    os.remove(analysis.path)
+                    removed += 1
+            except Exception as exc:
+                self._append_log(f"删除失败：{analysis.rel_path} | {exc}")
+                continue
+            self.tree.delete(item)
+            self._result_by_item.pop(item, None)
+        self._append_log(f"已删除 {removed} 张照片。")
+        if not self.tree.get_children():
+            self.delete_btn.config(state="disabled")
+
+    def _ask_delete_all(self):
+        flagged = [analysis for analysis in self._results if analysis.eye_issues]
+        if not flagged:
+            return
+        if aurora_askyesno(
+            "批量删除确认",
+            f"检测到 {len(flagged)} 张可能闭眼或视线异常的照片，是否立即全部删除？",
+            parent=self.root,
+        ):
+            for analysis in flagged:
+                try:
+                    if os.path.isfile(analysis.path):
+                        os.remove(analysis.path)
+                except Exception as exc:
+                    self._append_log(f"批量删除失败：{analysis.rel_path} | {exc}")
+            self._append_log("批量删除完成。刷新列表。")
+            self._refresh_after_deletion()
+
+    def _refresh_after_deletion(self):
+        for item, analysis in list(self._result_by_item.items()):
+            if not os.path.isfile(analysis.path):
+                self.tree.delete(item)
+                self._result_by_item.pop(item, None)
+        if not self.tree.get_children():
+            self.delete_btn.config(state="disabled")
+
+    def _back_to_import(self):
+        if callable(self.on_back):
+            self.on_back()
+
 # ---------- 列表刷新 ----------
 def refresh_sources(info_box, combo_src, auto_pick=False):
     all_drives=list_drives()
@@ -3113,7 +3810,6 @@ def main_ui():
 
     root.grid_rowconfigure(1, weight=1)
     root.grid_columnconfigure(0, weight=1)
-    root.grid_columnconfigure(1, weight=0)
 
     state = SimpleNamespace(
         cancel_ev=threading.Event(),
