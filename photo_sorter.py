@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from types import SimpleNamespace
 
 
+
 from app.bootstrap_models import get_current_providers, register_session_builder, rebuild_sessions
 from app.providers import cuda_available, load_pref, pick_providers, save_pref
 
@@ -60,6 +61,32 @@ except Exception:  # pragma: no cover - optional dependency fallback
     exifread = None
     if not SUPPRESS_RUNTIME_WARNINGS:
         print("[警告] 未检测到 exifread，将使用文件修改时间作为拍摄时间。", file=sys.stderr)
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    np = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 numpy，部分智能检测功能将受限。", file=sys.stderr)
+
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    mp = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 MediaPipe，无法启用智能闭眼检测。", file=sys.stderr)
+
+try:
+    from insightface.app import FaceAnalysis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    FaceAnalysis = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[提示] 未检测到 insightface，GPU 加速闭眼检测将不可用。", file=sys.stderr)
+
+try:
+    import onnxruntime  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    onnxruntime = None
 
 try:
     import numpy as np  # type: ignore
@@ -458,6 +485,11 @@ class DetectionResult:
     mean_luminance: float = 0.0
     exposure_issue: Optional[str] = None
     clipped_ratio: float = 0.0
+
+
+# 兼容早期代码中使用的 PhotoQualityResult 类型名称，防止导入时出现 NameError。
+# 废片检测结果结构未发生变化，因此直接复用 DetectionResult。
+PhotoQualityResult = DetectionResult
 
 
 class PhotoWasteDetector:
