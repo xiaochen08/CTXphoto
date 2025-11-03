@@ -13,13 +13,17 @@
 # - 操作按钮样式统一并区分启用、禁用与暂停状态
 
 import os, sys, json, time, shutil, platform, subprocess, re, threading, queue, math
+from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from types import SimpleNamespace
+
+from app.bootstrap_models import get_current_providers, register_session_builder, rebuild_sessions
+from app.providers import cuda_available, load_pref, pick_providers, save_pref
 
 VERSION = "v1.7.8"
 CONFIG_FILE = "photo_sorter_config.json"
@@ -55,6 +59,32 @@ except Exception:  # pragma: no cover - optional dependency fallback
     exifread = None
     if not SUPPRESS_RUNTIME_WARNINGS:
         print("[警告] 未检测到 exifread，将使用文件修改时间作为拍摄时间。", file=sys.stderr)
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    np = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 numpy，部分智能检测功能将受限。", file=sys.stderr)
+
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    mp = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 MediaPipe，无法启用智能闭眼检测。", file=sys.stderr)
+
+try:
+    from insightface.app import FaceAnalysis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    FaceAnalysis = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[提示] 未检测到 insightface，GPU 加速闭眼检测将不可用。", file=sys.stderr)
+
+try:
+    import onnxruntime  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    onnxruntime = None
 
 try:
     import numpy as np  # type: ignore
@@ -119,6 +149,37 @@ def format_eta(seconds: float) -> str:
         hours = math.ceil(hours)
         return f"剩余约 {int(hours)} 小时"
     return f"剩余约 {hours:.1f} 小时"
+
+
+def enable_high_dpi_awareness() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes  # Local import to avoid cost on non-Windows
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def set_tk_scaling(root: tk.Tk) -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes  # Local import to avoid cost elsewhere
+
+        hdc = ctypes.windll.user32.GetDC(0)
+        if not hdc:
+            return
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+        if dpi <= 0:
+            return
+        root.tk.call("tk", "scaling", dpi / 96.0)
+    except Exception:
+        pass
 
 
 def get_drive_type_code(letter):
@@ -373,9 +434,10 @@ class DetectionResult:
 
 
 class PhotoWasteDetector:
-    def __init__(self) -> None:
+    def __init__(self, providers: Optional[List[str]] = None) -> None:
         self._face_mesh = None
         self._mesh_lock = threading.Lock()
+        self._insightface = None
         self.eye_detection_ready = False
         self.requirements_hint = (
             "1) CPU 精准检测：pip install mediapipe==0.10.9 opencv-python numpy\n"
@@ -383,15 +445,27 @@ class PhotoWasteDetector:
             "   并下载模型 https://huggingface.co/deepinsight/insightface/resolve/main/models/buffalo_l.zip\n"
             "安装后将模型解压到 %APPDATA%/insightface/models 或 ~/.insightface/models。"
         )
+        self.providers = list(providers) if providers else ["CPUExecutionProvider"]
+        self.current_providers: List[str] = list(self.providers)
         self.available_providers: List[str] = []
-        if onnxruntime is not None:
-            try:
-                self.available_providers = list(onnxruntime.get_available_providers())
-            except Exception:
-                self.available_providers = []
+        self.refresh_available_providers()
         self._init_models()
 
+    def refresh_available_providers(self) -> List[str]:
+        providers: List[str] = []
+        if onnxruntime is not None:
+            try:
+                providers = list(onnxruntime.get_available_providers())
+            except Exception:
+                providers = []
+        self.available_providers = providers
+        return providers
+
     def _init_models(self) -> None:
+        self._init_face_mesh()
+        self._init_insightface(self.providers)
+
+    def _init_face_mesh(self) -> None:
         if mp is None or np is None:
             return
         try:
@@ -408,6 +482,66 @@ class PhotoWasteDetector:
             self.eye_detection_ready = False
             if not SUPPRESS_RUNTIME_WARNINGS:
                 print(f"[警告] 初始化 MediaPipe FaceMesh 失败：{exc}", file=sys.stderr)
+
+    def _init_insightface(self, providers: Optional[List[str]]) -> None:
+        if FaceAnalysis is None:
+            self.current_providers = list(providers or ["CPUExecutionProvider"])
+            return
+        try:
+            runtime_providers = providers or ["CPUExecutionProvider"]
+            engine = FaceAnalysis(name="buffalo_l", providers=runtime_providers)
+            engine.prepare(ctx_id=0, det_size=(640, 640))
+            self._insightface = engine
+            self.current_providers = list(runtime_providers)
+        except Exception as exc:
+            self._insightface = None
+            if not SUPPRESS_RUNTIME_WARNINGS:
+                print(f"[提示] InsightFace 初始化失败：{exc}", file=sys.stderr)
+
+    def set_providers(self, providers: List[str]) -> Dict[str, List[str]]:
+        desired = list(providers) or ["CPUExecutionProvider"]
+        self.providers = list(desired)
+        if FaceAnalysis is not None and onnxruntime is not None:
+            try:
+                engine = FaceAnalysis(name="buffalo_l", providers=desired)
+                engine.prepare(ctx_id=0, det_size=(640, 640))
+                self._insightface = engine
+                self.current_providers = list(desired)
+            except Exception as exc:
+                raise RuntimeError(f"InsightFace 初始化失败：{exc}") from exc
+        else:
+            self.current_providers = list(desired)
+        return {"providers": list(self.current_providers)}
+
+    def describe_model_inventory(self) -> List[str]:
+        messages: List[str] = []
+        if FaceAnalysis is None:
+            messages.append("insightface 未安装，跳过模型自检。")
+            return messages
+        candidates: List[Path] = []
+        home_model = Path.home() / ".insightface" / "models"
+        if home_model.exists():
+            candidates.append(home_model)
+        if sys.platform == "win32":
+            appdata = os.environ.get("APPDATA")
+            if appdata:
+                win_model = Path(appdata) / "insightface" / "models"
+                if win_model.exists():
+                    candidates.append(win_model)
+        if not candidates:
+            messages.append("未发现 insightface 模型目录，请按说明下载并解压。")
+            return messages
+        for path in candidates:
+            try:
+                onnx_files = [p.name for p in path.rglob("*.onnx")][:3]
+            except Exception:
+                onnx_files = []
+            if onnx_files:
+                messages.append(f"模型目录：{path}")
+                messages.append(f"示例模型文件：{', '.join(onnx_files)}")
+            else:
+                messages.append(f"模型目录：{path}（未找到 .onnx 文件）")
+        return messages
 
     def close(self) -> None:
         mesh = self._face_mesh
@@ -571,11 +705,15 @@ class WasteDetectionUI:
         self.frame = frame
         self.theme_key = theme_key
         self.on_back = on_back
-        self.detector = PhotoWasteDetector()
+        self._pref = load_pref()
+        initial_providers = pick_providers(self._pref.get("prefer_cuda", True))
+        self.detector = PhotoWasteDetector(initial_providers)
         self.folder_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="待机")
         self.summary_var = tk.StringVar(value="尚未检测")
         self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_pct_var = tk.StringVar(value="0.0%")
+        self.progress_eta_var = tk.StringVar(value="预计剩余时间：估算中…")
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._running = False
@@ -590,19 +728,24 @@ class WasteDetectionUI:
         self._abnormal_count = 0
         self._under_count = 0
         self._over_count = 0
+        self._progress_state: Dict[str, Any] = {}
+        self._progress_job: Optional[str] = None
 
         self._build_ui()
         self.apply_theme(theme_key)
         self._update_detector_hint()
+        self._register_rebuilder()
+        self._log_provider_status()
 
     def _build_ui(self) -> None:
-        self.frame.grid_columnconfigure(0, weight=1)
-        self.frame.grid_columnconfigure(1, weight=0)
+        self.frame.grid_columnconfigure(0, weight=3)
+        self.frame.grid_columnconfigure(1, weight=2)
         self.frame.grid_rowconfigure(0, weight=1)
 
         left_col = ttk.Frame(self.frame, style="AuroraPanel.TFrame")
         left_col.grid(row=0, column=0, sticky="nsew")
         left_col.grid_rowconfigure(1, weight=1)
+        left_col.grid_columnconfigure(0, weight=1)
 
         control_card = ttk.Frame(left_col, style="AuroraCard.TFrame", padding=(28, 24))
         control_card.grid(row=0, column=0, sticky="ew")
@@ -626,25 +769,38 @@ class WasteDetectionUI:
 
         btn_row = ttk.Frame(control_card, style="AuroraCard.TFrame")
         btn_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(18, 0))
-        btn_row.grid_columnconfigure(0, weight=0)
-        btn_row.grid_columnconfigure(1, weight=0)
-        btn_row.grid_columnconfigure(2, weight=1)
+        for col in range(4):
+            btn_row.grid_columnconfigure(col, weight=0)
+        btn_row.grid_columnconfigure(3, weight=1)
 
         self.start_btn = ttk.Button(btn_row, text="开始检测", style="AuroraPrimary.TButton", command=self.start_detection)
         self.start_btn.grid(row=0, column=0, sticky="w")
         self.stop_btn = ttk.Button(btn_row, text="停止", style="AuroraWarning.TButton", command=self.stop_detection, state="disabled")
         self.stop_btn.grid(row=0, column=1, sticky="w", padx=(16, 0))
+        self.cuda_btn = ttk.Button(btn_row, text="CUDA 加速", style="AuroraPrimary.TButton", command=self._toggle_cuda)
+        self.cuda_btn.grid(row=0, column=2, sticky="w", padx=(16, 0))
         self.back_btn = ttk.Button(btn_row, text="返回导入界面", style="AuroraGhost.TButton", command=self._handle_back)
-        self.back_btn.grid(row=0, column=2, sticky="e")
+        self.back_btn.grid(row=0, column=3, sticky="e")
 
-        progress_bar = ttk.Progressbar(
-            control_card,
+        progress_panel = ttk.Frame(control_card, style="AuroraCard.TFrame")
+        progress_panel.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(20, 0))
+        progress_panel.grid_columnconfigure(0, weight=1)
+
+        self.progress_bar = ttk.Progressbar(
+            progress_panel,
             mode="determinate",
             variable=self.progress_var,
             maximum=100.0,
             style="Aurora.Horizontal.TProgressbar",
         )
-        progress_bar.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(20, 0))
+        self.progress_bar.grid(row=0, column=0, sticky="ew")
+
+        progress_info = ttk.Frame(progress_panel, style="AuroraCard.TFrame")
+        progress_info.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        progress_info.grid_columnconfigure(0, weight=0)
+        progress_info.grid_columnconfigure(1, weight=1)
+        ttk.Label(progress_info, textvariable=self.progress_pct_var, style="AuroraStatus.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(progress_info, textvariable=self.progress_eta_var, style="AuroraStatus.TLabel").grid(row=0, column=1, sticky="e")
 
         ttk.Label(control_card, textvariable=self.status_var, style="AuroraStatus.TLabel").grid(
             row=5, column=0, columnspan=3, sticky="w", pady=(16, 0)
@@ -657,6 +813,8 @@ class WasteDetectionUI:
         results_card.grid(row=1, column=0, sticky="nsew", pady=(20, 0))
         results_card.grid_rowconfigure(1, weight=1)
         results_card.grid_columnconfigure(0, weight=1)
+        results_card.grid_columnconfigure(1, weight=0)
+        results_card.grid_columnconfigure(2, weight=0)
         ttk.Label(results_card, text="检测结果", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w")
 
         columns = ("filename", "issues", "brightness", "clip", "path")
@@ -696,6 +854,7 @@ class WasteDetectionUI:
         right_card = ttk.Frame(self.frame, style="AuroraCard.TFrame", padding=(28, 24))
         right_card.grid(row=0, column=1, sticky="nsew", padx=(24, 0))
         right_card.grid_rowconfigure(1, weight=1)
+        right_card.grid_columnconfigure(0, weight=1)
         ttk.Label(right_card, text="预览", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w")
         self.preview_canvas = tk.Canvas(right_card, width=360, height=360, highlightthickness=0, bd=0)
         self.preview_canvas.grid(row=1, column=0, sticky="nsew", pady=(18, 0))
@@ -708,12 +867,14 @@ class WasteDetectionUI:
         self.tree.bind("<Double-1>", self.on_tree_double_click)
 
         set_button_state(self.stop_btn, active=False, style_active="AuroraWarning.TButton")
+        self._refresh_cuda_button()
 
     def apply_theme(self, theme_key: str) -> None:
         self.theme_key = theme_key
         set_text_theme(self.log_text, theme_key)
         bg = AURORA_THEME["CARD_HIGHLIGHT"]
         self.preview_canvas.configure(bg=bg)
+        self._refresh_cuda_button()
 
     def _update_detector_hint(self) -> None:
         if self.detector.eye_detection_ready:
@@ -731,6 +892,168 @@ class WasteDetectionUI:
         if FaceAnalysis is None:
             hint += "\n(未检测到 insightface，GPU 大模型需单独安装。)"
         self.detector_hint.configure(text=hint)
+
+    def _register_rebuilder(self) -> None:
+        def _builder(providers: List[str]):
+            return self.detector.set_providers(list(providers))
+
+        register_session_builder("waste-detector", _builder)
+        errors = rebuild_sessions(self.detector.current_providers)
+        if errors:
+            self._log_rebuild_errors(errors)
+            fallback = pick_providers(False)
+            rebuild_sessions(fallback)
+            self.detector.set_providers(fallback)
+            self._pref["prefer_cuda"] = False
+            save_pref(self._pref)
+            self._refresh_cuda_button()
+            self._log("初始化 CUDA 失败，已回退到 CPUExecutionProvider。")
+
+    def _log_rebuild_errors(self, errors: List[Tuple[str, Exception]]) -> None:
+        for name, exc in errors:
+            self._log(f"重建会话失败（{name}）：{exc}")
+
+    def _log_provider_status(self) -> None:
+        providers = self.detector.refresh_available_providers()
+        if onnxruntime is None:
+            self._log("未检测到 onnxruntime，默认使用 CPUExecutionProvider。")
+        elif providers:
+            self._log(f"可用推理引擎：{', '.join(providers)}")
+        else:
+            self._log("onnxruntime 未返回可用 providers，已回退到 CPU。")
+        current = get_current_providers() or self.detector.current_providers
+        self._log(f"当前推理 providers：{', '.join(current)}")
+        for line in self.detector.describe_model_inventory():
+            self._log(line)
+
+    def _refresh_cuda_button(self) -> None:
+        available = cuda_available()
+        prefer = self._pref.get("prefer_cuda", True)
+        if not available:
+            self.cuda_btn.config(text="CUDA 加速", style="AuroraDisabled.TButton", state="disabled", cursor="arrow")
+            return
+        text = "CUDA 加速 ✓" if prefer else "CUDA 加速"
+        style = "AuroraSuccess.TButton" if prefer else "AuroraPrimary.TButton"
+        self.cuda_btn.config(text=text, style=style, state="normal", cursor="hand2")
+
+    def _toggle_cuda(self) -> None:
+        if not cuda_available():
+            return
+        prefer = self._pref.get("prefer_cuda", True)
+        new_prefer = not prefer
+        self._pref["prefer_cuda"] = new_prefer
+        save_pref(self._pref)
+        target = pick_providers(new_prefer)
+        self._log(f"尝试切换推理 providers：{', '.join(target)}")
+        errors = rebuild_sessions(target)
+        if errors:
+            self._log_rebuild_errors(errors)
+            aurora_showwarning("CUDA 切换失败", "无法启用 CUDA，加速已回退到 CPU。", parent=self.root)
+            self._pref["prefer_cuda"] = False
+            save_pref(self._pref)
+            fallback = pick_providers(False)
+            fallback_errors = rebuild_sessions(fallback)
+            if fallback_errors:
+                self._log_rebuild_errors(fallback_errors)
+            self.detector.set_providers(fallback)
+            self._log("已切换到 CPUExecutionProvider。")
+        else:
+            self._log(f"推理会话已重建，当前 providers：{', '.join(get_current_providers())}")
+        self._refresh_cuda_button()
+        self._update_detector_hint()
+
+    def _init_progress_state(self) -> None:
+        now = time.time()
+        self._progress_state = {
+            "alpha": 0.2,
+            "rate": 0.0,
+            "last_done": 0,
+            "last_elapsed": 0.0,
+            "total": self._total_files,
+            "simulate": True,
+            "sim_start": now,
+            "sim_value": 0.0,
+            "active": True,
+        }
+        self.progress_var.set(0.0)
+        self.progress_pct_var.set("0.0%")
+        self.progress_eta_var.set("预计剩余时间：估算中…")
+        self._start_progress_loop()
+
+    def _start_progress_loop(self) -> None:
+        self._stop_progress_loop()
+        if not self._progress_state:
+            return
+        self._progress_state["active"] = True
+        self._progress_job = self.root.after(200, self._progress_loop)
+
+    def _progress_loop(self) -> None:
+        if not self._progress_state.get("active"):
+            return
+        if self._progress_state.get("simulate"):
+            now = time.time()
+            sim_start = self._progress_state.get("sim_start", now)
+            elapsed = max(0.0, now - sim_start)
+            current = self._progress_state.get("sim_value", 0.0)
+            if elapsed <= 10.0:
+                target = min(20.0, (elapsed / 10.0) * 20.0)
+            else:
+                target = min(95.0, current + 0.4)
+            value = max(current, target)
+            self._progress_state["sim_value"] = value
+            self.progress_var.set(value)
+            self.progress_pct_var.set(f"{value:.1f}%")
+            self.progress_eta_var.set("预计剩余时间：估算中…")
+        self._progress_job = self.root.after(200, self._progress_loop)
+
+    def _stop_progress_loop(self) -> None:
+        if self._progress_job is not None:
+            try:
+                self.root.after_cancel(self._progress_job)
+            except Exception:
+                pass
+            self._progress_job = None
+        if self._progress_state:
+            self._progress_state["active"] = False
+            self._progress_state["simulate"] = False
+
+    def _apply_progress(self, processed: int, elapsed: float) -> None:
+        if not self._progress_state:
+            return
+        total = self._progress_state.get("total", self._total_files)
+        self._progress_state["total"] = total
+        prev_done = self._progress_state.get("last_done", 0)
+        delta_done = processed - prev_done
+        prev_elapsed = self._progress_state.get("last_elapsed", 0.0)
+        delta_time = max(1e-3, elapsed - prev_elapsed)
+        inst_rate = max(0.0, delta_done / delta_time) if delta_done >= 0 else 0.0
+        rate = self._progress_state.get("rate", 0.0)
+        if inst_rate > 0:
+            alpha = self._progress_state.get("alpha", 0.2)
+            self._progress_state["rate"] = inst_rate if rate <= 0 else (alpha * inst_rate + (1 - alpha) * rate)
+        self._progress_state["last_done"] = processed
+        self._progress_state["last_elapsed"] = elapsed
+        self._progress_state["simulate"] = False
+        pct = 0.0
+        if total > 0:
+            pct = min(100.0, processed / total * 100.0)
+        self.progress_var.set(pct)
+        self.progress_pct_var.set(f"{pct:.1f}%")
+        rate = self._progress_state.get("rate", 0.0)
+        if total > 0 and processed >= total:
+            self.progress_eta_var.set("预计剩余时间：00:00:00")
+        elif rate > 0 and total:
+            remaining = max(0.0, (total - processed) / rate)
+            self.progress_eta_var.set(f"预计剩余时间：{self._format_eta(remaining)}")
+        else:
+            self.progress_eta_var.set("预计剩余时间：估算中…")
+
+    @staticmethod
+    def _format_eta(seconds: float) -> str:
+        secs = max(0, int(round(seconds)))
+        minutes, sec = divmod(secs, 60)
+        hour, minute = divmod(minutes, 60)
+        return f"{hour:d}:{minute:02d}:{sec:02d}"
 
     def choose_folder(self) -> None:
         path = filedialog.askdirectory(parent=self.root)
@@ -791,21 +1114,25 @@ class WasteDetectionUI:
         self._over_count = 0
         self._processed_files = 0
         self._total_files = len(files)
-        self.progress_var.set(0.0)
+        self._init_progress_state()
         self.status_var.set(f"检测中：0/{self._total_files}")
         self._update_summary()
         set_button_state(self.start_btn, active=False)
         set_button_state(self.stop_btn, active=True, style_active="AuroraWarning.TButton")
         self._log(f"开始检测，共 {self._total_files} 张 JPG 照片。")
+        current_providers = get_current_providers() or self.detector.current_providers
+        self._log(f"使用推理 providers：{', '.join(current_providers)}")
 
         def _worker():
+            start_perf = time.perf_counter()
             try:
                 for idx, path in enumerate(files, start=1):
                     if self._stop_event.is_set():
                         break
                     detection = self.detector.analyze_image(path)
                     self._processed_files = idx
-                    self.root.after(0, lambda idx=idx: self._update_progress(idx))
+                    elapsed = time.perf_counter() - start_perf
+                    self.root.after(0, lambda idx=idx, elapsed=elapsed: self._update_progress(idx, elapsed))
                     if detection:
                         self.root.after(0, lambda det=detection: self._handle_detection(det))
                         if detection.closed_eye_count > 0:
@@ -818,23 +1145,25 @@ class WasteDetectionUI:
         self._thread = threading.Thread(target=_worker, daemon=True)
         self._thread.start()
 
-    def _update_progress(self, processed: int) -> None:
-        total = max(1, self._total_files)
-        pct = min(100.0, processed / total * 100.0)
-        self.progress_var.set(pct)
+    def _update_progress(self, processed: int, elapsed: float) -> None:
+        self._apply_progress(processed, elapsed)
         self.status_var.set(f"检测中：{processed}/{self._total_files}")
 
     def _finish_detection(self, stopped: bool) -> None:
         if not self._running:
             return
         self._running = False
+        self._stop_progress_loop()
         set_button_state(self.start_btn, active=True)
         set_button_state(self.stop_btn, active=False, style_active="AuroraWarning.TButton")
         if stopped:
             self.status_var.set(f"已停止，完成 {self._processed_files}/{self._total_files}")
             self._log("检测已停止。")
+            self.progress_eta_var.set("预计剩余时间：--:--:--")
         else:
             self.progress_var.set(100.0)
+            self.progress_pct_var.set("100.0%")
+            self.progress_eta_var.set("预计剩余时间：00:00:00")
             self.status_var.set(f"检测完成，共 {self._total_files} 张")
             self._log("检测完成。")
         self._update_summary()
@@ -2932,12 +3261,14 @@ def main_ui():
     if theme_key not in {DEFAULT_THEME_KEY}:
         theme_key = DEFAULT_THEME_KEY
 
+    enable_high_dpi_awareness()
     try:
         root = tk.Tk()
     except Exception:
         print("[提示] 无法初始化图形界面，自动切换到命令行模式。")
         run_cli(reason="无法初始化图形界面")
         return
+    set_tk_scaling(root)
     root.title(f"陈同学影像管理助手  {VERSION}")
     root.geometry("1180x760")
     root.minsize(960, 640)
