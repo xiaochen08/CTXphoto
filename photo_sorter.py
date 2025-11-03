@@ -13,11 +13,15 @@
 # - 操作按钮样式统一并区分启用、禁用与暂停状态
 
 import os, sys, json, time, shutil, platform, subprocess, re, threading, queue, math
+from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from datetime import datetime
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 from types import SimpleNamespace
+
 
 VERSION = "v1.7.8"
 CONFIG_FILE = "photo_sorter_config.json"
@@ -26,6 +30,12 @@ THEMES = ["暗黑"]
 DEFAULT_THEME_KEY = "dark"
 LOG_PANEL_WIDTH = 360
 COPY_BUFFER_SIZE = 4 * 1024 * 1024
+
+DEFAULT_WASTE_SETTINGS = {
+    "quality_threshold": 90,
+    "overexposure_threshold": 85,
+    "underexposure_threshold": 15,
+}
 
 SUPPRESS_RUNTIME_WARNINGS = any(arg in ("-h", "--help") for arg in sys.argv[1:])
 
@@ -37,10 +47,13 @@ except Exception:  # pragma: no cover - best effort fallback for limited environ
         print("[警告] 未检测到 psutil，部分磁盘信息功能将受限。", file=sys.stderr)
 
 try:
-    from PIL import Image, ExifTags
+    from PIL import Image, ExifTags, ImageDraw, ImageTk, ImageStat
 except Exception:  # pragma: no cover - optional dependency fallback
     Image = None
     ExifTags = SimpleNamespace(TAGS={})
+    ImageDraw = None
+    ImageTk = None
+    ImageStat = None
     if not SUPPRESS_RUNTIME_WARNINGS:
         print("[警告] 未检测到 Pillow，EXIF 读取功能将受限。", file=sys.stderr)
 
@@ -50,6 +63,32 @@ except Exception:  # pragma: no cover - optional dependency fallback
     exifread = None
     if not SUPPRESS_RUNTIME_WARNINGS:
         print("[警告] 未检测到 exifread，将使用文件修改时间作为拍摄时间。", file=sys.stderr)
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    np = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 numpy，部分智能检测功能将受限。", file=sys.stderr)
+
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    mp = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[警告] 未检测到 MediaPipe，无法启用智能闭眼检测。", file=sys.stderr)
+
+try:
+    from insightface.app import FaceAnalysis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    FaceAnalysis = None
+    if not SUPPRESS_RUNTIME_WARNINGS:
+        print("[提示] 未检测到 insightface，GPU 加速闭眼检测将不可用。", file=sys.stderr)
+
+try:
+    import onnxruntime  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    onnxruntime = None
 
 try:
     import winsound
@@ -88,6 +127,37 @@ def format_eta(seconds: float) -> str:
         hours = math.ceil(hours)
         return f"剩余约 {int(hours)} 小时"
     return f"剩余约 {hours:.1f} 小时"
+
+
+def enable_high_dpi_awareness() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes  # Local import to avoid cost on non-Windows
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def set_tk_scaling(root: tk.Tk) -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes  # Local import to avoid cost elsewhere
+
+        hdc = ctypes.windll.user32.GetDC(0)
+        if not hdc:
+            return
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+        if dpi <= 0:
+            return
+        root.tk.call("tk", "scaling", dpi / 96.0)
+    except Exception:
+        pass
 
 
 def get_drive_type_code(letter):
@@ -197,8 +267,16 @@ def load_config():
             if "theme" not in cfg:
                 cfg["theme"] = DEFAULT_THEME_KEY
             if "sash_ratio" not in cfg: cfg["sash_ratio"] = 0.55
+            if "waste_detection" not in cfg or not isinstance(cfg.get("waste_detection"), dict):
+                cfg["waste_detection"] = dict(DEFAULT_WASTE_SETTINGS)
+            else:
+                for key, value in DEFAULT_WASTE_SETTINGS.items():
+                    cfg["waste_detection"].setdefault(key, value)
+                cfg["waste_detection"].pop("realtime_filter", None)
             return cfg
-    return {"last_target_root": "", "theme": DEFAULT_THEME_KEY, "sash_ratio": 0.55}
+    default_cfg = {"last_target_root": "", "theme": DEFAULT_THEME_KEY, "sash_ratio": 0.55}
+    default_cfg["waste_detection"] = dict(DEFAULT_WASTE_SETTINGS)
+    return default_cfg
 
 def save_config(cfg):
     with open(CONFIG_FILE,"w",encoding="utf-8") as f: json.dump(cfg,f,ensure_ascii=False,indent=2)
@@ -307,6 +385,1326 @@ def log_add(text_widget, line):
     text_widget.see("end")
     text_widget.configure(state="disabled")
 
+
+# ---------- 废片检测 ----------
+LEFT_EYE_EAR_POINTS = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_EAR_POINTS = [263, 387, 385, 362, 380, 373]
+LEFT_EYE_BOUNDARY_POINTS = [33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7]
+RIGHT_EYE_BOUNDARY_POINTS = [263, 466, 388, 387, 386, 385, 384, 398, 362, 382, 381, 380, 374, 373, 390, 249]
+LEFT_IRIS_POINTS = [468, 469, 470, 471, 472]
+RIGHT_IRIS_POINTS = [473, 474, 475, 476, 477]
+
+CLOSED_EAR_THRESHOLD = 0.19
+PARTIAL_EAR_THRESHOLD = 0.23
+
+
+@dataclass
+class EyeRegion:
+    bbox: Tuple[int, int, int, int]
+    issues: List[str] = field(default_factory=list)
+    ear: float = 0.0
+    side: str = "left"
+
+
+@dataclass
+class DetectionResult:
+    path: str
+    issues: List[str] = field(default_factory=list)
+    closed_eye_count: int = 0
+    partial_eye_count: int = 0
+    abnormal_eye_count: int = 0
+    eye_regions: List[EyeRegion] = field(default_factory=list)
+    mean_luminance: float = 0.0
+    exposure_issue: Optional[str] = None
+    clipped_ratio: float = 0.0
+    overexposure_ratio: float = 0.0
+    underexposure_ratio: float = 0.0
+    high_light_ratio: float = 0.0
+    low_light_ratio: float = 0.0
+    quality_score: float = 100.0
+    is_waste: bool = False
+
+
+# 兼容早期代码中使用的 PhotoQualityResult 类型名称，防止导入时出现 NameError。
+# 废片检测结果结构未发生变化，因此直接复用 DetectionResult。
+PhotoQualityResult = DetectionResult
+
+
+class PhotoWasteDetector:
+    def __init__(self, providers: Optional[List[str]] = None) -> None:
+        self._face_mesh = None
+        self._mesh_lock = threading.Lock()
+        self._insightface = None
+        self.eye_detection_ready = False
+        self.requirements_hint = (
+            "安装依赖：pip install mediapipe==0.10.9 opencv-python numpy\n"
+            "可选安装 insightface 与 onnxruntime 以启用更精准的人眼检测（CPU 模式）。\n"
+            "模型下载：https://huggingface.co/deepinsight/insightface/resolve/main/models/buffalo_l.zip\n"
+            "安装后将模型解压到 %APPDATA%/insightface/models 或 ~/.insightface/models。"
+        )
+        desired = list(providers) if providers else ["CPUExecutionProvider"]
+        if not desired:
+            desired = ["CPUExecutionProvider"]
+        self.providers = desired
+        self.current_providers: List[str] = list(self.providers)
+        self.available_providers: List[str] = []
+        self.refresh_available_providers()
+        self._init_models()
+
+    def refresh_available_providers(self) -> List[str]:
+        providers: List[str] = []
+        if onnxruntime is not None:
+            try:
+                providers = list(onnxruntime.get_available_providers())
+            except Exception:
+                providers = []
+        self.available_providers = providers
+        return providers
+
+    def _init_models(self) -> None:
+        self._init_face_mesh()
+        self._init_insightface(self.providers)
+
+    def _init_face_mesh(self) -> None:
+        if mp is None or np is None:
+            return
+        try:
+            self._face_mesh = mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=True,
+                refine_landmarks=True,
+                max_num_faces=10,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            self.eye_detection_ready = True
+        except Exception as exc:
+            self._face_mesh = None
+            self.eye_detection_ready = False
+            if not SUPPRESS_RUNTIME_WARNINGS:
+                print(f"[警告] 初始化 MediaPipe FaceMesh 失败：{exc}", file=sys.stderr)
+
+    def _init_insightface(self, providers: Optional[List[str]]) -> None:
+        if FaceAnalysis is None:
+            self.current_providers = list(providers or ["CPUExecutionProvider"])
+            return
+        try:
+            runtime_providers = providers or ["CPUExecutionProvider"]
+            engine = FaceAnalysis(name="buffalo_l", providers=runtime_providers)
+            engine.prepare(ctx_id=0, det_size=(640, 640))
+            self._insightface = engine
+            self.current_providers = list(runtime_providers)
+        except Exception as exc:
+            self._insightface = None
+            if not SUPPRESS_RUNTIME_WARNINGS:
+                print(f"[提示] InsightFace 初始化失败：{exc}", file=sys.stderr)
+
+    def set_providers(self, providers: List[str]) -> Dict[str, List[str]]:
+        desired = ["CPUExecutionProvider"]
+        self.providers = list(desired)
+        self.current_providers = list(desired)
+        if FaceAnalysis is not None and onnxruntime is not None:
+            try:
+                engine = FaceAnalysis(name="buffalo_l", providers=desired)
+                engine.prepare(ctx_id=0, det_size=(640, 640))
+                self._insightface = engine
+            except Exception as exc:
+                raise RuntimeError(f"InsightFace 初始化失败：{exc}") from exc
+        return {"providers": list(self.current_providers)}
+
+    def describe_model_inventory(self) -> List[str]:
+        messages: List[str] = []
+        if FaceAnalysis is None:
+            messages.append("insightface 未安装，跳过模型自检。")
+            return messages
+        candidates: List[Path] = []
+        home_model = Path.home() / ".insightface" / "models"
+        if home_model.exists():
+            candidates.append(home_model)
+        if sys.platform == "win32":
+            appdata = os.environ.get("APPDATA")
+            if appdata:
+                win_model = Path(appdata) / "insightface" / "models"
+                if win_model.exists():
+                    candidates.append(win_model)
+        if not candidates:
+            messages.append("未发现 insightface 模型目录，请按说明下载并解压。")
+            return messages
+        for path in candidates:
+            try:
+                onnx_files = [p.name for p in path.rglob("*.onnx")][:3]
+            except Exception:
+                onnx_files = []
+            if onnx_files:
+                messages.append(f"模型目录：{path}")
+                messages.append(f"示例模型文件：{', '.join(onnx_files)}")
+            else:
+                messages.append(f"模型目录：{path}（未找到 .onnx 文件）")
+        return messages
+
+    def close(self) -> None:
+        mesh = self._face_mesh
+        if mesh is not None:
+            try:
+                mesh.close()
+            except Exception:
+                pass
+        self._face_mesh = None
+        self.eye_detection_ready = False
+
+    @staticmethod
+    def _landmark_to_point(landmark, width: int, height: int) -> Tuple[int, int]:
+        return int(landmark.x * width), int(landmark.y * height)
+
+    @staticmethod
+    def _eye_aspect_ratio(points: List[Tuple[int, int]]) -> float:
+        if len(points) != 6:
+            return 0.0
+        p1, p2, p3, p4, p5, p6 = points
+        def _dist(a, b):
+            return math.hypot(a[0] - b[0], a[1] - b[1])
+
+        denom = _dist(p1, p4)
+        if denom == 0:
+            return 0.0
+        ear = (_dist(p2, p6) + _dist(p3, p5)) / (2.0 * denom)
+        return ear
+
+    @staticmethod
+    def _bounding_box(points: List[Tuple[int, int]], width: int, height: int, padding: int = 4) -> Tuple[int, int, int, int]:
+        if not points:
+            return 0, 0, width, height
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        x0 = max(0, min(xs) - padding)
+        y0 = max(0, min(ys) - padding)
+        x1 = min(width, max(xs) + padding)
+        y1 = min(height, max(ys) + padding)
+        return x0, y0, x1, y1
+
+    @staticmethod
+    def _iris_issue(box: Tuple[int, int, int, int], iris_points: List[Tuple[int, int]]) -> Optional[str]:
+        if not iris_points:
+            return None
+        x0, y0, x1, y1 = box
+        w = max(1, x1 - x0)
+        h = max(1, y1 - y0)
+        cx = sum(p[0] for p in iris_points) / len(iris_points)
+        cy = sum(p[1] for p in iris_points) / len(iris_points)
+        rel_x = (cx - x0) / w
+        rel_y = (cy - y0) / h
+        if rel_y < 0.15 or rel_y > 0.85 or rel_x < 0.12 or rel_x > 0.88:
+            return "眼球偏离"
+        return None
+
+    def _analyze_face(self, face_landmarks, width: int, height: int, result: DetectionResult) -> None:
+        if np is None:
+            return
+        def _collect_points(indices):
+            pts = []
+            for idx in indices:
+                if idx < len(face_landmarks.landmark):
+                    pts.append(self._landmark_to_point(face_landmarks.landmark[idx], width, height))
+            return pts
+
+        for side, ear_indices, boundary_indices, iris_indices in (
+            ("left", LEFT_EYE_EAR_POINTS, LEFT_EYE_BOUNDARY_POINTS, LEFT_IRIS_POINTS),
+            ("right", RIGHT_EYE_EAR_POINTS, RIGHT_EYE_BOUNDARY_POINTS, RIGHT_IRIS_POINTS),
+        ):
+            eye_points = _collect_points(ear_indices)
+            if len(eye_points) != 6:
+                continue
+            ear = self._eye_aspect_ratio(eye_points)
+            boundary_points = _collect_points(boundary_indices)
+            iris_points = _collect_points(iris_indices)
+            box = self._bounding_box(boundary_points or eye_points, width, height)
+            issues: List[str] = []
+            if ear <= CLOSED_EAR_THRESHOLD:
+                issues.append("闭眼")
+                result.closed_eye_count += 1
+            elif ear <= PARTIAL_EAR_THRESHOLD:
+                issues.append("半眨眼")
+                result.partial_eye_count += 1
+            iris_issue = self._iris_issue(box, iris_points)
+            if iris_issue:
+                issues.append(iris_issue)
+                result.abnormal_eye_count += 1
+            if not issues:
+                continue
+            result.eye_regions.append(EyeRegion(bbox=box, issues=issues, ear=ear, side=side))
+            for issue in issues:
+                if issue not in result.issues:
+                    result.issues.append(issue)
+
+    def _analyze_exposure(self, image: Image.Image, result: DetectionResult) -> None:
+        try:
+            if ImageStat is not None:
+                stats = ImageStat.Stat(image.convert("L"))
+                mean = float(stats.mean[0])
+            elif np is not None:
+                gray = np.asarray(image.convert("L"))
+                mean = float(gray.mean())
+            else:
+                # 简易平均
+                pixels = list(image.convert("L").getdata())
+                mean = sum(pixels) / max(1, len(pixels))
+        except Exception:
+            mean = 0.0
+        result.mean_luminance = mean
+        exposure_issue = None
+        clipped_ratio = 0.0
+        dark_ratio = 0.0
+        bright_ratio = 0.0
+        try:
+            gray = np.asarray(image.convert("L")) if np is not None else None
+            if gray is not None:
+                dark_ratio = float(np.mean(gray < 40))
+                bright_ratio = float(np.mean(gray > 215))
+                clipped_ratio = max(dark_ratio, bright_ratio)
+                if mean < 55 and dark_ratio > 0.25:
+                    exposure_issue = "欠曝"
+                elif mean > 200 and bright_ratio > 0.25:
+                    exposure_issue = "过曝"
+        except Exception:
+            exposure_issue = None
+            clipped_ratio = 0.0
+            dark_ratio = 0.0
+            bright_ratio = 0.0
+        if exposure_issue:
+            result.exposure_issue = exposure_issue
+            if exposure_issue not in result.issues:
+                result.issues.append(exposure_issue)
+        result.clipped_ratio = clipped_ratio
+        result.overexposure_ratio = bright_ratio * 100.0
+        result.underexposure_ratio = dark_ratio * 100.0
+        result.high_light_ratio = bright_ratio * 100.0
+        result.low_light_ratio = dark_ratio * 100.0
+
+    def analyze_image(self, path: str) -> Optional[DetectionResult]:
+        if Image is None:
+            return None
+        try:
+            with Image.open(path) as im:
+                image = im.convert("RGB")
+        except Exception:
+            return None
+
+        result = DetectionResult(path=path)
+        self._analyze_exposure(image, result)
+
+        mesh = self._face_mesh
+        if mesh is not None and self.eye_detection_ready and np is not None:
+            arr = np.asarray(image)
+            with self._mesh_lock:
+                mesh_result = mesh.process(arr)
+            if mesh_result and mesh_result.multi_face_landmarks:
+                for face_landmarks in mesh_result.multi_face_landmarks:
+                    self._analyze_face(face_landmarks, image.width, image.height, result)
+
+        if not result.issues:
+            return None
+        return result
+
+
+class WasteDetectionUI:
+    def __init__(self, root: tk.Tk, frame: ttk.Frame, theme_key: str, on_back) -> None:
+        self.root = root
+        self.frame = frame
+        self.theme_key = theme_key
+        self.on_back = on_back
+        self.detector = PhotoWasteDetector(["CPUExecutionProvider"])
+        self.folder_var = tk.StringVar(value="")
+        self.status_var = tk.StringVar(value="待机")
+        self.summary_var = tk.StringVar(value="尚未检测")
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_pct_var = tk.StringVar(value="0.0%")
+        self.progress_eta_var = tk.StringVar(value="预计剩余时间：估算中…")
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._running = False
+        self._results: Dict[str, DetectionResult] = {}
+        self._preview_photo = None
+        self._processed_files = 0
+        self._total_files = 0
+        self._closed_count = 0
+        self._half_count = 0
+        self._abnormal_count = 0
+        self._under_count = 0
+        self._over_count = 0
+        self._progress_state: Dict[str, Any] = {}
+        self._progress_job: Optional[str] = None
+
+        self._config = load_config()
+        self._settings = dict(self._config.get("waste_detection", DEFAULT_WASTE_SETTINGS))
+        self._settings.pop("realtime_filter", None)
+        self.quality_var = tk.IntVar(value=int(self._settings.get("quality_threshold", 90)))
+        self.over_var = tk.IntVar(value=int(self._settings.get("overexposure_threshold", 85)))
+        self.under_var = tk.IntVar(value=int(self._settings.get("underexposure_threshold", 15)))
+        self._settings["quality_threshold"] = int(self.quality_var.get())
+        self._settings["overexposure_threshold"] = int(self.over_var.get())
+        self._settings["underexposure_threshold"] = int(self.under_var.get())
+        self._all_results: Dict[str, DetectionResult] = {}
+        self._result_order: List[str] = []
+        self._tree_items: Dict[str, str] = {}
+        self.filter_summary_var = tk.StringVar(value="筛选结果：尚未开始")
+        self.threshold_summary_var = tk.StringVar(value="")
+        self.over_value_var = tk.StringVar(value=f"{self.over_var.get()}%")
+        self.under_value_var = tk.StringVar(value=f"{self.under_var.get()}%")
+        self._suspend_threshold_callbacks = True
+
+        self._build_ui()
+        self._suspend_threshold_callbacks = False
+        self._update_threshold_summary()
+        self.apply_theme(theme_key)
+        self._update_detector_hint()
+        self._log_provider_status()
+
+    def _build_ui(self) -> None:
+        self.frame.grid_columnconfigure(0, weight=3)
+        self.frame.grid_columnconfigure(1, weight=2)
+        self.frame.grid_rowconfigure(0, weight=1)
+
+        left_col = ttk.Frame(self.frame, style="AuroraPanel.TFrame")
+        left_col.grid(row=0, column=0, sticky="nsew")
+        left_col.grid_rowconfigure(2, weight=1)
+        left_col.grid_columnconfigure(0, weight=1)
+
+        control_card = ttk.Frame(left_col, style="AuroraCard.TFrame", padding=(28, 24))
+        control_card.grid(row=0, column=0, sticky="ew")
+        control_card.grid_columnconfigure(1, weight=1)
+        ttk.Label(control_card, text="废片检测", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w", columnspan=3)
+
+        ttk.Label(control_card, text="待检测文件夹", style="AuroraBody.TLabel").grid(row=1, column=0, sticky="e", pady=(16, 0))
+        entry = ttk.Entry(control_card, textvariable=self.folder_var, width=60, state="readonly", style="Aurora.TEntry")
+        entry.grid(row=1, column=1, sticky="ew", pady=(16, 0))
+        self.browse_btn = ttk.Button(control_card, text="浏览", style="AuroraPrimary.TButton", command=self.choose_folder)
+        self.browse_btn.grid(row=1, column=2, sticky="w", padx=(16, 0), pady=(16, 0))
+
+        self.detector_hint = ttk.Label(
+            control_card,
+            text="",
+            style="AuroraBody.TLabel",
+            wraplength=520,
+            justify="left",
+        )
+        self.detector_hint.grid(row=2, column=0, columnspan=3, sticky="w", pady=(18, 0))
+
+        btn_row = ttk.Frame(control_card, style="AuroraCard.TFrame")
+        btn_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(18, 0))
+        for col in range(3):
+            btn_row.grid_columnconfigure(col, weight=0)
+        btn_row.grid_columnconfigure(2, weight=1)
+
+        self.start_btn = ttk.Button(btn_row, text="开始检测", style="AuroraPrimary.TButton", command=self.start_detection)
+        self.start_btn.grid(row=0, column=0, sticky="w")
+        self.stop_btn = ttk.Button(btn_row, text="停止", style="AuroraWarning.TButton", command=self.stop_detection, state="disabled")
+        self.stop_btn.grid(row=0, column=1, sticky="w", padx=(16, 0))
+        self.back_btn = ttk.Button(btn_row, text="返回导入界面", style="AuroraGhost.TButton", command=self._handle_back)
+        self.back_btn.grid(row=0, column=2, sticky="e")
+
+        progress_panel = ttk.Frame(control_card, style="AuroraCard.TFrame")
+        progress_panel.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(20, 0))
+        progress_panel.grid_columnconfigure(0, weight=1)
+
+        self.progress_bar = ttk.Progressbar(
+            progress_panel,
+            mode="determinate",
+            variable=self.progress_var,
+            maximum=100.0,
+            style="Aurora.Horizontal.TProgressbar",
+        )
+        self.progress_bar.grid(row=0, column=0, sticky="ew")
+
+        progress_info = ttk.Frame(progress_panel, style="AuroraCard.TFrame")
+        progress_info.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        progress_info.grid_columnconfigure(0, weight=0)
+        progress_info.grid_columnconfigure(1, weight=1)
+        ttk.Label(progress_info, textvariable=self.progress_pct_var, style="AuroraStatus.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(progress_info, textvariable=self.progress_eta_var, style="AuroraStatus.TLabel").grid(row=0, column=1, sticky="e")
+
+        ttk.Label(control_card, textvariable=self.status_var, style="AuroraStatus.TLabel").grid(
+            row=5, column=0, columnspan=3, sticky="w", pady=(16, 0)
+        )
+        ttk.Label(control_card, textvariable=self.summary_var, style="AuroraStatus.TLabel").grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(8, 0)
+        )
+
+        results_card = ttk.Frame(left_col, style="AuroraCard.TFrame", padding=(28, 24))
+        results_card.grid(row=1, column=0, sticky="nsew", pady=(20, 0))
+        results_card.grid_rowconfigure(4, weight=1)
+        results_card.grid_rowconfigure(6, weight=1)
+        results_card.grid_columnconfigure(0, weight=1)
+        results_card.grid_columnconfigure(1, weight=0)
+        results_card.grid_columnconfigure(2, weight=0)
+        ttk.Label(results_card, text="检测结果", style="AuroraSection.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+
+        ttk.Label(results_card, textvariable=self.threshold_summary_var, style="AuroraStatus.TLabel").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(10, 0)
+        )
+
+        controls_frame = ttk.Frame(results_card, style="AuroraCard.TFrame")
+        controls_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+        for col in range(3):
+            controls_frame.grid_columnconfigure(col, weight=1)
+
+        quality_frame = ttk.Frame(controls_frame, style="AuroraCard.TFrame")
+        quality_frame.grid(row=0, column=0, sticky="ew")
+        quality_frame.grid_columnconfigure(0, weight=1)
+        ttk.Label(quality_frame, text="废片检测率阈值", style="AuroraBody.TLabel").grid(row=0, column=0, sticky="w")
+        quality_buttons = ttk.Frame(quality_frame, style="AuroraCard.TFrame")
+        quality_buttons.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        for idx, value in enumerate((80, 90, 95, 100)):
+            ttk.Radiobutton(
+                quality_buttons,
+                text=f"{value}%",
+                value=value,
+                variable=self.quality_var,
+                command=self._on_quality_change,
+            ).grid(row=0, column=idx, padx=(0 if idx == 0 else 12, 0))
+
+        over_frame = ttk.Frame(controls_frame, style="AuroraCard.TFrame")
+        over_frame.grid(row=0, column=1, sticky="ew", padx=(12, 0))
+        over_frame.grid_columnconfigure(0, weight=1)
+        ttk.Label(over_frame, text="过曝率阈值", style="AuroraBody.TLabel").grid(row=0, column=0, sticky="w")
+        self.over_scale = ttk.Scale(over_frame, from_=0, to=100, orient="horizontal", command=self._on_over_scale)
+        self.over_scale.set(self.over_var.get())
+        self.over_scale.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(over_frame, textvariable=self.over_value_var, style="AuroraCaption.TLabel").grid(
+            row=2, column=0, sticky="e", pady=(6, 0)
+        )
+
+        under_frame = ttk.Frame(controls_frame, style="AuroraCard.TFrame")
+        under_frame.grid(row=0, column=2, sticky="ew", padx=(12, 0))
+        under_frame.grid_columnconfigure(0, weight=1)
+        ttk.Label(under_frame, text="欠曝率阈值", style="AuroraBody.TLabel").grid(row=0, column=0, sticky="w")
+        self.under_scale = ttk.Scale(under_frame, from_=0, to=100, orient="horizontal", command=self._on_under_scale)
+        self.under_scale.set(self.under_var.get())
+        self.under_scale.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(under_frame, textvariable=self.under_value_var, style="AuroraCaption.TLabel").grid(
+            row=2, column=0, sticky="e", pady=(6, 0)
+        )
+
+        ttk.Label(results_card, textvariable=self.filter_summary_var, style="AuroraCaption.TLabel").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(12, 0)
+        )
+
+        columns = (
+            "filename",
+            "status",
+            "issues",
+            "over",
+            "under",
+            "highlight",
+            "lowlight",
+            "brightness",
+            "quality",
+            "path",
+        )
+        self.tree = ttk.Treeview(results_card, columns=columns, show="headings", height=12, selectmode="browse")
+        self.tree.heading("filename", text="文件名")
+        self.tree.heading("status", text="检测类型")
+        self.tree.heading("issues", text="闭眼")
+        self.tree.heading("over", text="过曝率 %")
+        self.tree.heading("under", text="欠曝率 %")
+        self.tree.heading("highlight", text="高光占比 %")
+        self.tree.heading("lowlight", text="低光占比 %")
+        self.tree.heading("brightness", text="平均亮度")
+        self.tree.heading("quality", text="质量分数")
+        self.tree.column("filename", width=220, anchor="w")
+        self.tree.column("status", width=100, anchor="center")
+        self.tree.column("issues", width=220, anchor="w")
+        self.tree.column("over", width=110, anchor="center")
+        self.tree.column("under", width=110, anchor="center")
+        self.tree.column("highlight", width=120, anchor="center")
+        self.tree.column("lowlight", width=120, anchor="center")
+        self.tree.column("brightness", width=110, anchor="center")
+        self.tree.column("quality", width=110, anchor="center")
+        self.tree.column("path", width=0, stretch=False)
+        self.tree.grid(row=4, column=0, sticky="nsew", pady=(18, 0))
+
+        tree_scroll = ttk.Scrollbar(results_card, orient="vertical", command=self.tree.yview, style="Aurora.Vertical.TScrollbar")
+        tree_scroll.grid(row=4, column=1, sticky="ns", pady=(18, 0))
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+
+        self.tree_menu = tk.Menu(self.tree, tearoff=0)
+        self.tree_menu.add_command(label="提取当前筛选结果到‘废片’", command=self._extract_filtered_to_waste)
+
+        action_row = ttk.Frame(results_card, style="AuroraCard.TFrame")
+        action_row.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        action_row.grid_columnconfigure(0, weight=0)
+        action_row.grid_columnconfigure(1, weight=0)
+        action_row.grid_columnconfigure(2, weight=1)
+
+        self.open_btn = ttk.Button(action_row, text="打开所在文件夹", style="AuroraPrimary.TButton", command=self.open_selected)
+        self.open_btn.grid(row=0, column=0, sticky="w")
+        self.delete_btn = ttk.Button(action_row, text="删除所选照片", style="AuroraDanger.TButton", command=self.delete_selected)
+        self.delete_btn.grid(row=0, column=1, sticky="w", padx=(16, 0))
+
+        self.log_text = tk.Text(results_card, height=6, wrap="word", bd=0, relief="flat", state="disabled")
+        self.log_text.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(18, 0))
+        log_scroll = ttk.Scrollbar(results_card, orient="vertical", command=self.log_text.yview, style="Aurora.Vertical.TScrollbar")
+        log_scroll.grid(row=6, column=2, sticky="ns", pady=(18, 0))
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+
+        right_card = ttk.Frame(self.frame, style="AuroraCard.TFrame", padding=(28, 24))
+        right_card.grid(row=0, column=1, sticky="nsew", padx=(24, 0))
+        right_card.grid_rowconfigure(1, weight=1)
+        right_card.grid_columnconfigure(0, weight=1)
+        ttk.Label(right_card, text="预览", style="AuroraSection.TLabel").grid(row=0, column=0, sticky="w")
+        self.preview_canvas = tk.Canvas(right_card, width=360, height=360, highlightthickness=0, bd=0)
+        self.preview_canvas.grid(row=1, column=0, sticky="nsew", pady=(18, 0))
+        self.detail_var = tk.StringVar(value="选择列表中的照片查看预览")
+        ttk.Label(right_card, textvariable=self.detail_var, style="AuroraBody.TLabel", wraplength=360, justify="left").grid(
+            row=2, column=0, sticky="w", pady=(16, 0)
+        )
+
+        self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
+        self.tree.bind("<Button-3>", self._on_tree_right_click)
+
+        set_button_state(self.stop_btn, active=False, style_active="AuroraWarning.TButton")
+        self._update_filter_summary()
+
+    def apply_theme(self, theme_key: str) -> None:
+        self.theme_key = theme_key
+        set_text_theme(self.log_text, theme_key)
+        bg = AURORA_THEME["CARD_HIGHLIGHT"]
+        self.preview_canvas.configure(bg=bg)
+
+    def _update_detector_hint(self) -> None:
+        if self.detector.eye_detection_ready:
+            hint = "检测模块已就绪，可开始分析。"
+        else:
+            hint = (
+                "尚未准备好闭眼检测，请先安装依赖：\n"
+                f"{self.detector.requirements_hint}"
+            )
+        providers = getattr(self.detector, "available_providers", [])
+        if providers:
+            hint += f"\n已检测到 ONNX Runtime providers：{', '.join(providers)}"
+        elif onnxruntime is None:
+            hint += "\n(未检测到 onnxruntime，可按需安装 onnxruntime。)"
+        if FaceAnalysis is None:
+            hint += "\n(未检测到 insightface，可选安装以提升检测准确度。)"
+        self.detector_hint.configure(text=hint)
+
+    def _log_provider_status(self) -> None:
+        providers = self.detector.refresh_available_providers()
+        if onnxruntime is None:
+            self._log("未检测到 onnxruntime，默认使用 CPUExecutionProvider。")
+        elif providers:
+            self._log(f"已检测到的 providers：{', '.join(providers)}")
+        else:
+            self._log("onnxruntime 未返回可用 providers，已回退到 CPU。")
+        current = self.detector.current_providers
+        self._log(f"当前推理 providers：{', '.join(current)}")
+        for line in self.detector.describe_model_inventory():
+            self._log(line)
+
+    def _init_progress_state(self) -> None:
+        now = time.time()
+        self._progress_state = {
+            "alpha": 0.2,
+            "rate": 0.0,
+            "last_done": 0,
+            "last_elapsed": 0.0,
+            "total": self._total_files,
+            "simulate": True,
+            "sim_start": now,
+            "sim_value": 0.0,
+            "active": True,
+        }
+        self.progress_var.set(0.0)
+        self.progress_pct_var.set("0.0%")
+        self.progress_eta_var.set("预计剩余时间：估算中…")
+        self._start_progress_loop()
+
+    def _start_progress_loop(self) -> None:
+        self._stop_progress_loop()
+        if not self._progress_state:
+            return
+        self._progress_state["active"] = True
+        self._progress_job = self.root.after(200, self._progress_loop)
+
+    def _progress_loop(self) -> None:
+        if not self._progress_state.get("active"):
+            return
+        if self._progress_state.get("simulate"):
+            now = time.time()
+            sim_start = self._progress_state.get("sim_start", now)
+            elapsed = max(0.0, now - sim_start)
+            current = self._progress_state.get("sim_value", 0.0)
+            if elapsed <= 10.0:
+                target = min(20.0, (elapsed / 10.0) * 20.0)
+            else:
+                target = min(95.0, current + 0.4)
+            value = max(current, target)
+            self._progress_state["sim_value"] = value
+            self.progress_var.set(value)
+            self.progress_pct_var.set(f"{value:.1f}%")
+            self.progress_eta_var.set("预计剩余时间：估算中…")
+        self._progress_job = self.root.after(200, self._progress_loop)
+
+    def _stop_progress_loop(self) -> None:
+        if self._progress_job is not None:
+            try:
+                self.root.after_cancel(self._progress_job)
+            except Exception:
+                pass
+            self._progress_job = None
+        if self._progress_state:
+            self._progress_state["active"] = False
+            self._progress_state["simulate"] = False
+
+    def _apply_progress(self, processed: int, elapsed: float) -> None:
+        if not self._progress_state:
+            return
+        total = self._progress_state.get("total", self._total_files)
+        self._progress_state["total"] = total
+        prev_done = self._progress_state.get("last_done", 0)
+        delta_done = processed - prev_done
+        prev_elapsed = self._progress_state.get("last_elapsed", 0.0)
+        delta_time = max(1e-3, elapsed - prev_elapsed)
+        inst_rate = max(0.0, delta_done / delta_time) if delta_done >= 0 else 0.0
+        rate = self._progress_state.get("rate", 0.0)
+        if inst_rate > 0:
+            alpha = self._progress_state.get("alpha", 0.2)
+            self._progress_state["rate"] = inst_rate if rate <= 0 else (alpha * inst_rate + (1 - alpha) * rate)
+        self._progress_state["last_done"] = processed
+        self._progress_state["last_elapsed"] = elapsed
+        self._progress_state["simulate"] = False
+        pct = 0.0
+        if total > 0:
+            pct = min(100.0, processed / total * 100.0)
+        self.progress_var.set(pct)
+        self.progress_pct_var.set(f"{pct:.1f}%")
+        rate = self._progress_state.get("rate", 0.0)
+        if total > 0 and processed >= total:
+            self.progress_eta_var.set("预计剩余时间：00:00:00")
+        elif rate > 0 and total:
+            remaining = max(0.0, (total - processed) / rate)
+            self.progress_eta_var.set(f"预计剩余时间：{self._format_eta(remaining)}")
+        else:
+            self.progress_eta_var.set("预计剩余时间：估算中…")
+
+    @staticmethod
+    def _format_eta(seconds: float) -> str:
+        secs = max(0, int(round(seconds)))
+        minutes, sec = divmod(secs, 60)
+        hour, minute = divmod(minutes, 60)
+        return f"{hour:d}:{minute:02d}:{sec:02d}"
+
+    def choose_folder(self) -> None:
+        path = filedialog.askdirectory(parent=self.root)
+        if not path:
+            return
+        self.folder_var.set(path)
+        self._log(f"已选择检测目录：{path}")
+
+    def _is_removable_path(self, path: str) -> bool:
+        if os.name == "nt":
+            drive = os.path.splitdrive(os.path.abspath(path))[0]
+            if drive:
+                try:
+                    return get_drive_type_code(drive) == 2
+                except Exception:
+                    return False
+        return False
+
+    def start_detection(self) -> None:
+        if self._running:
+            return
+        folder = self.folder_var.get().strip()
+        if not folder or not os.path.isdir(folder):
+            aurora_showwarning("提示", "请先选择有效的文件夹。", parent=self.root)
+            return
+        if self._is_removable_path(folder):
+            aurora_showwarning("提示", "请先将素材复制到电脑硬盘后再检测，避免直接操作存储卡。", parent=self.root)
+            return
+        files: List[str] = []
+        for root_dir, _, filenames in os.walk(folder):
+            for name in filenames:
+                if name.lower().endswith((".jpg", ".jpeg")):
+                    files.append(os.path.join(root_dir, name))
+        files.sort()
+        if not files:
+            aurora_showinfo("提示", "所选目录中未找到 JPG 照片。", parent=self.root)
+            return
+
+        self._running = True
+        self._stop_event.clear()
+        self._results.clear()
+        self._all_results.clear()
+        self._result_order.clear()
+        self._tree_items.clear()
+        self.tree.delete(*self.tree.get_children())
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+        self.preview_canvas.delete("all")
+        self.detail_var.set("检测中，选中结果可查看预览")
+        self._closed_count = 0
+        self._half_count = 0
+        self._abnormal_count = 0
+        self._under_count = 0
+        self._over_count = 0
+        self._processed_files = 0
+        self._total_files = len(files)
+        self._init_progress_state()
+        self.status_var.set(f"检测中：0/{self._total_files}")
+        self._update_summary()
+        self._update_filter_summary()
+        set_button_state(self.start_btn, active=False)
+        set_button_state(self.stop_btn, active=True, style_active="AuroraWarning.TButton")
+        self._log(f"开始检测，共 {self._total_files} 张 JPG 照片。")
+        current_providers = self.detector.current_providers
+        self._log(f"使用推理 providers：{', '.join(current_providers)}")
+
+        def _worker():
+            start_perf = time.perf_counter()
+            try:
+                for idx, path in enumerate(files, start=1):
+                    if self._stop_event.is_set():
+                        break
+                    detection = self.detector.analyze_image(path)
+                    self._processed_files = idx
+                    elapsed = time.perf_counter() - start_perf
+                    self.root.after(0, lambda idx=idx, elapsed=elapsed: self._update_progress(idx, elapsed))
+                    if detection:
+                        self.root.after(0, lambda det=detection: self._handle_detection(det))
+                stopped = self._stop_event.is_set()
+            finally:
+                self.root.after(0, lambda stopped=bool(self._stop_event.is_set()): self._finish_detection(stopped))
+
+        self._thread = threading.Thread(target=_worker, daemon=True)
+        self._thread.start()
+
+    def _update_progress(self, processed: int, elapsed: float) -> None:
+        self._apply_progress(processed, elapsed)
+        self.status_var.set(f"检测中：{processed}/{self._total_files}")
+
+    def _finish_detection(self, stopped: bool) -> None:
+        if not self._running:
+            return
+        self._running = False
+        self._stop_progress_loop()
+        set_button_state(self.start_btn, active=True)
+        set_button_state(self.stop_btn, active=False, style_active="AuroraWarning.TButton")
+        if stopped:
+            self.status_var.set(f"已停止，完成 {self._processed_files}/{self._total_files}")
+            self._log("检测已停止。")
+            self.progress_eta_var.set("预计剩余时间：--:--:--")
+        else:
+            self.progress_var.set(100.0)
+            self.progress_pct_var.set("100.0%")
+            self.progress_eta_var.set("预计剩余时间：00:00:00")
+            self.status_var.set(f"检测完成，共 {self._total_files} 张")
+            self._log("检测完成。")
+        self._update_summary()
+        self._update_filter_summary()
+        if not stopped:
+            self._show_completion_prompt()
+
+    def stop_detection(self) -> None:
+        if not self._running:
+            return
+        self._stop_event.set()
+        self._log("正在停止检测，请稍候…")
+
+    def _update_summary(self) -> None:
+        summary = (
+            f"闭眼 {self._closed_count} 张 | 半眨眼 {self._half_count} 张 | "
+            f"眼部异常 {self._abnormal_count} 张 | 欠曝 {self._under_count} 张 | 过曝 {self._over_count} 张"
+        )
+        self.summary_var.set(summary)
+
+    def _evaluate_detection(self, detection: DetectionResult) -> None:
+        score = 100.0
+        if detection.closed_eye_count > 0:
+            score -= 60.0
+        if detection.partial_eye_count > 0:
+            score -= 20.0
+        if detection.abnormal_eye_count > 0:
+            score -= 15.0
+        if detection.exposure_issue == "欠曝":
+            score -= 20.0
+        if detection.exposure_issue == "过曝":
+            score -= 20.0
+        score -= min(25.0, detection.clipped_ratio * 100.0 * 0.3)
+        detection.quality_score = max(0.0, score)
+        quality_threshold = float(self._settings.get("quality_threshold", 90))
+        detection.is_waste = detection.quality_score < quality_threshold
+
+    def _increment_counters(self, detection: DetectionResult) -> None:
+        if "闭眼" in detection.issues:
+            self._closed_count += 1
+        if "半眨眼" in detection.issues:
+            self._half_count += 1
+        if any(issue in detection.issues for issue in ("眼球偏离",)):
+            self._abnormal_count += 1
+        if detection.exposure_issue == "欠曝":
+            self._under_count += 1
+        if detection.exposure_issue == "过曝":
+            self._over_count += 1
+
+    def _deduct_counters(self, detection: DetectionResult) -> None:
+        if "闭眼" in detection.issues and self._closed_count > 0:
+            self._closed_count -= 1
+        if "半眨眼" in detection.issues and self._half_count > 0:
+            self._half_count -= 1
+        if any(issue in detection.issues for issue in ("眼球偏离",)) and self._abnormal_count > 0:
+            self._abnormal_count -= 1
+        if detection.exposure_issue == "欠曝" and self._under_count > 0:
+            self._under_count -= 1
+        if detection.exposure_issue == "过曝" and self._over_count > 0:
+            self._over_count -= 1
+
+    def _matches_filter(self, detection: DetectionResult) -> bool:
+        quality_threshold = float(self._settings.get("quality_threshold", 90))
+        over_threshold = float(self._settings.get("overexposure_threshold", 85))
+        under_threshold = float(self._settings.get("underexposure_threshold", 15))
+        waste_hit = detection.quality_score < quality_threshold
+        over_hit = detection.overexposure_ratio >= over_threshold
+        under_hit = detection.underexposure_ratio >= under_threshold
+        return waste_hit or over_hit or under_hit
+
+    def _tree_row_values(self, detection: DetectionResult) -> Tuple[str, ...]:
+        issues_text = "、".join(detection.issues) if detection.issues else "--"
+        brightness_text = f"{detection.mean_luminance:.1f}" if detection.mean_luminance else "--"
+        over_text = f"{detection.overexposure_ratio:.1f}%"
+        under_text = f"{detection.underexposure_ratio:.1f}%"
+        highlight_text = f"{detection.high_light_ratio:.1f}%"
+        lowlight_text = f"{detection.low_light_ratio:.1f}%"
+        status = "废片" if detection.is_waste else "正常"
+        quality_text = f"{detection.quality_score:.1f}"
+        return (
+            os.path.basename(detection.path),
+            status,
+            issues_text,
+            over_text,
+            under_text,
+            highlight_text,
+            lowlight_text,
+            brightness_text,
+            quality_text,
+            detection.path,
+        )
+
+    def _get_filtered_paths(self) -> List[str]:
+        ordered = list(self._result_order)
+        filtered: List[str] = []
+        for path in ordered:
+            detection = self._all_results.get(path)
+            if detection and self._matches_filter(detection):
+                filtered.append(path)
+        return filtered
+
+    def _rebuild_tree(self, preserve_selection: bool = True) -> None:
+        if preserve_selection:
+            selection = self.tree.selection()
+            selected_path = None
+            if selection:
+                det = self._results.get(selection[0])
+                if det:
+                    selected_path = det.path
+        else:
+            selected_path = None
+        self.tree.delete(*self.tree.get_children())
+        self._results.clear()
+        self._tree_items.clear()
+        filtered_paths = self._get_filtered_paths()
+        for path in filtered_paths:
+            detection = self._all_results.get(path)
+            if not detection:
+                continue
+            iid = self.tree.insert("", "end", values=self._tree_row_values(detection))
+            self._results[iid] = detection
+            self._tree_items[path] = iid
+            if selected_path and path == selected_path:
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+        if not self.tree.selection():
+            first = self.tree.get_children()
+            if first:
+                self.tree.selection_set(first[0])
+                self.tree.focus(first[0])
+                self.on_tree_select()
+            else:
+                self.preview_canvas.delete("all")
+                self.detail_var.set("选择列表中的照片查看预览")
+        self._update_filter_summary(filtered_paths)
+
+    def _apply_quality_threshold(self) -> None:
+        quality_threshold = float(self._settings.get("quality_threshold", 90))
+        for detection in self._all_results.values():
+            detection.is_waste = detection.quality_score < quality_threshold
+
+    def _update_filter_summary(self, filtered_paths: Optional[List[str]] = None) -> None:
+        if filtered_paths is None:
+            filtered_paths = self._get_filtered_paths()
+        total = len(self._result_order)
+        if total == 0:
+            if self._running:
+                text = "筛选结果：检测中…"
+            else:
+                text = "筛选结果：暂无数据"
+        else:
+            quality_threshold = float(self._settings.get("quality_threshold", 90))
+            over_threshold = float(self._settings.get("overexposure_threshold", 85))
+            under_threshold = float(self._settings.get("underexposure_threshold", 15))
+            waste = over = under = 0
+            for path in filtered_paths:
+                detection = self._all_results.get(path)
+                if not detection:
+                    continue
+                if detection.quality_score < quality_threshold:
+                    waste += 1
+                if detection.overexposure_ratio >= over_threshold:
+                    over += 1
+                if detection.underexposure_ratio >= under_threshold:
+                    under += 1
+            text = f"筛选结果：废片 {waste} 张  过曝 {over} 张  欠曝 {under} 张"
+        self.filter_summary_var.set(text)
+
+    def _update_threshold_summary(self) -> None:
+        summary = (
+            f"检测率：{int(self.quality_var.get())}%  |  "
+            f"过曝率：{int(self.over_var.get())}%  |  "
+            f"欠曝率：{int(self.under_var.get())}%"
+        )
+        self.threshold_summary_var.set(summary)
+
+    def _on_threshold_change(self) -> None:
+        if getattr(self, "_suspend_threshold_callbacks", False):
+            self._update_threshold_summary()
+            self.over_value_var.set(f"{int(self.over_var.get())}%")
+            self.under_value_var.set(f"{int(self.under_var.get())}%")
+            return
+        self._settings["quality_threshold"] = int(self.quality_var.get())
+        self._settings["overexposure_threshold"] = int(self.over_var.get())
+        self._settings["underexposure_threshold"] = int(self.under_var.get())
+        self.over_value_var.set(f"{self._settings['overexposure_threshold']}%")
+        self.under_value_var.set(f"{self._settings['underexposure_threshold']}%")
+        self._update_threshold_summary()
+        self._config["waste_detection"] = dict(self._settings)
+        try:
+            save_config(self._config)
+        except Exception as exc:
+            self._log(f"保存检测参数失败：{exc}")
+        self._apply_quality_threshold()
+        self._rebuild_tree(preserve_selection=True)
+
+    def _on_quality_change(self) -> None:
+        if getattr(self, "_suspend_threshold_callbacks", False):
+            self.quality_var.set(int(self.quality_var.get()))
+            self._update_threshold_summary()
+            return
+        try:
+            value = int(self.quality_var.get())
+        except Exception:
+            value = int(DEFAULT_WASTE_SETTINGS.get("quality_threshold", 90))
+        self.quality_var.set(value)
+        self._on_threshold_change()
+
+    def _on_over_scale(self, value: str) -> None:
+        try:
+            val = int(round(float(value)))
+        except Exception:
+            return
+        self.over_var.set(val)
+        self._on_threshold_change()
+
+    def _on_under_scale(self, value: str) -> None:
+        try:
+            val = int(round(float(value)))
+        except Exception:
+            return
+        self.under_var.set(val)
+        self._on_threshold_change()
+
+    def _generate_unique_destination(self, dest_dir: str, filename: str) -> str:
+        base, ext = os.path.splitext(filename)
+        candidate = filename
+        counter = 1
+        while os.path.exists(os.path.join(dest_dir, candidate)):
+            candidate = f"{base}_{counter}{ext}"
+            counter += 1
+        return os.path.join(dest_dir, candidate)
+
+    def _extract_results(self, results: List[DetectionResult]) -> None:
+        folder = self.folder_var.get().strip()
+        if not folder:
+            aurora_showwarning("提示", "请先选择检测目录。", parent=self.root)
+            return
+        waste_dir = os.path.join(folder, "废片")
+        try:
+            os.makedirs(waste_dir, exist_ok=True)
+        except Exception as exc:
+            aurora_showwarning("提取失败", f"无法创建废片目录：{exc}", parent=self.root)
+            return
+        moved = 0
+        removed_paths: List[str] = []
+        for detection in results:
+            src = detection.path
+            if not src or not os.path.isfile(src):
+                self._log(f"提取跳过，源文件不存在：{src}")
+                continue
+            dest = self._generate_unique_destination(waste_dir, os.path.basename(src))
+            try:
+                shutil.move(src, dest)
+                removed_paths.append(src)
+                moved += 1
+                self._log(f"移动废片：{src} -> {dest}")
+            except Exception as exc:
+                self._log(f"提取失败：{src} -> {exc}")
+        if moved:
+            self._log(f"已移动 {moved} 张疑似废片至 {waste_dir}")
+        if removed_paths:
+            for path in removed_paths:
+                self._remove_detection(path, rebuild=False)
+            self._rebuild_tree(preserve_selection=False)
+        else:
+            self._rebuild_tree()
+
+    def _confirm_extract_move(self, title: str, message: str) -> bool:
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        apply_theme(dialog, self.theme_key)
+        accent = tk.Frame(dialog, bg=AURORA_THEME["ACCENT_LINE"], height=4, bd=0, highlightthickness=0)
+        accent.pack(fill="x")
+        container = ttk.Frame(dialog, style="AuroraCard.TFrame", padding=(28, 24))
+        container.pack(fill="both", expand=True)
+        ttk.Label(container, text=message, style="AuroraBody.TLabel", wraplength=460, justify="left").pack(
+            anchor="w"
+        )
+
+        result = {"move": False}
+
+        def _choose(move: bool) -> None:
+            result["move"] = move
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(container, style="AuroraCard.TFrame")
+        btn_frame.pack(anchor="e", pady=(24, 0))
+        ttk.Button(
+            btn_frame,
+            text="移动到‘废片’",
+            style="AuroraPrimary.TButton",
+            command=lambda: _choose(True),
+        ).pack(side="right")
+        ttk.Button(
+            btn_frame,
+            text="取消",
+            style="AuroraGhost.TButton",
+            command=lambda: _choose(False),
+        ).pack(side="right", padx=(12, 0))
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: _choose(False))
+        dialog.update_idletasks()
+        center_on_parent(dialog, self.root)
+        dialog.deiconify()
+        dialog.wait_window()
+        return bool(result.get("move"))
+
+    def _show_completion_prompt(self) -> None:
+        waste_results = [self._all_results[path] for path in self._result_order if self._all_results.get(path, None) and self._all_results[path].is_waste]
+        count = len(waste_results)
+        if count == 0:
+            aurora_showinfo("检测完成", "检测完成，未发现疑似废片。", parent=self.root)
+            return
+        if self._confirm_extract_move(
+            "检测完成",
+            f"检测完成，共检测到 {count} 张废片。是否将这些照片移动到独立文件夹‘废片’以便后续筛选？",
+        ):
+            self._extract_results(waste_results)
+        else:
+            self._log("已取消提取疑似废片。")
+
+    def _extract_filtered_to_waste(self) -> None:
+        paths = self._get_filtered_paths()
+        results = [self._all_results[p] for p in paths if self._all_results.get(p)]
+        if not results:
+            aurora_showinfo("提示", "当前没有符合筛选条件的照片。", parent=self.root)
+            return
+        if self._confirm_extract_move(
+            "提取废片",
+            f"当前筛选命中 {len(results)} 张照片。是否将它们移动到‘废片’文件夹？",
+        ):
+            self._extract_results(results)
+        else:
+            self._log("已取消提取当前筛选结果。")
+
+    def _on_tree_right_click(self, event) -> None:
+        try:
+            self.tree_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.tree_menu.grab_release()
+
+    def _handle_detection(self, detection: DetectionResult) -> None:
+        self._evaluate_detection(detection)
+        path = detection.path
+        if path not in self._all_results:
+            self._result_order.append(path)
+        self._all_results[path] = detection
+        self._increment_counters(detection)
+        issues_text = "、".join(detection.issues) if detection.issues else "未识别具体问题"
+        status_text = "废片" if detection.is_waste else "正常"
+        self._log(f"发现问题照片：{detection.path} -> {issues_text} (标记：{status_text})")
+        should_show = self._matches_filter(detection)
+        if should_show:
+            iid = self.tree.insert("", "end", values=self._tree_row_values(detection))
+            self._results[iid] = detection
+            self._tree_items[path] = iid
+            if not self.tree.selection():
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+                self.on_tree_select()
+        self._update_summary()
+        self._update_filter_summary()
+
+    def _remove_detection(self, path: str, rebuild: bool = True) -> None:
+        detection = None
+        stored_path = None
+        if path in self._all_results:
+            detection = self._all_results.pop(path)
+            stored_path = path
+        else:
+            for p, det in list(self._all_results.items()):
+                if det.path == path:
+                    detection = self._all_results.pop(p)
+                    stored_path = p
+                    break
+        if stored_path is not None:
+            self._tree_items.pop(stored_path, None)
+            self._result_order = [p for p in self._result_order if p != stored_path]
+        if detection is None:
+            for iid, det in list(self._results.items()):
+                if det.path == path:
+                    detection = det
+                    self._results.pop(iid, None)
+        else:
+            for iid, det in list(self._results.items()):
+                if det.path == detection.path:
+                    self._results.pop(iid, None)
+        if detection:
+            self._deduct_counters(detection)
+        self._update_summary()
+        if rebuild:
+            self._rebuild_tree(preserve_selection=False)
+
+    def on_tree_select(self, _event=None) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        iid = selection[0]
+        detection = self._results.get(iid)
+        if detection:
+            self._show_preview(detection)
+
+    def on_tree_double_click(self, _event=None) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        self.open_selected()
+
+    def _show_preview(self, detection: DetectionResult) -> None:
+        if Image is None or ImageTk is None:
+            self.detail_var.set("当前环境缺少 Pillow，无法生成预览。")
+            return
+        try:
+            with Image.open(detection.path) as im:
+                image = im.convert("RGB")
+        except Exception as exc:
+            self.detail_var.set(f"无法打开图片：{exc}")
+            return
+
+        draw = ImageDraw.Draw(image) if ImageDraw is not None else None
+        for region in detection.eye_regions:
+            if draw is not None:
+                draw.rectangle(region.bbox, outline="#FF4D4F", width=4)
+                label = "、".join(region.issues)
+                if label:
+                    text_pos = (region.bbox[0] + 6, region.bbox[1] + 6)
+                    draw.text(text_pos, label, fill="#FF4D4F")
+
+        canvas_w = int(self.preview_canvas.winfo_width() or 360)
+        canvas_h = int(self.preview_canvas.winfo_height() or 360)
+        if canvas_w <= 0:
+            canvas_w = 360
+        if canvas_h <= 0:
+            canvas_h = 360
+        scale = min(canvas_w / image.width, canvas_h / image.height, 1.0)
+        if scale < 1.0:
+            new_size = (int(image.width * scale), int(image.height * scale))
+            image = image.resize(new_size, Image.LANCZOS)
+
+        photo = ImageTk.PhotoImage(image)
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_image(canvas_w // 2, canvas_h // 2, image=photo)
+        self._preview_photo = photo
+
+        extra = []
+        if detection.exposure_issue:
+            extra.append(detection.exposure_issue)
+        detail = f"{os.path.basename(detection.path)}\n问题：{ '、'.join(detection.issues) }"
+        detail += f"\n平均亮度：{detection.mean_luminance:.1f}"
+        if extra:
+            detail += f"\n曝光：{'、'.join(extra)}"
+        detail += f"\n过曝率：{detection.overexposure_ratio:.1f}% | 欠曝率：{detection.underexposure_ratio:.1f}%"
+        detail += f"\n高光占比：{detection.high_light_ratio:.1f}% | 低光占比：{detection.low_light_ratio:.1f}%"
+        detail += f"\n标记状态：{'废片' if detection.is_waste else '正常'} | 质量分：{detection.quality_score:.1f}"
+        self.detail_var.set(detail)
+
+    def open_selected(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        detection = self._results.get(selection[0])
+        if not detection:
+            return
+        folder = os.path.dirname(detection.path)
+        if not folder:
+            return
+        _open_folder(folder)
+
+    def delete_selected(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        iid = selection[0]
+        detection = self._results.get(iid)
+        if not detection:
+            return
+        if not aurora_askyesno("删除确认", f"确定删除 {detection.path}?", parent=self.root):
+            return
+        try:
+            os.remove(detection.path)
+        except Exception as exc:
+            aurora_showwarning("删除失败", f"无法删除文件：{exc}", parent=self.root)
+            return
+        self._log(f"已删除照片：{detection.path}")
+        self._remove_detection(detection.path)
+
+    def _handle_back(self) -> None:
+        if self._running:
+            if not aurora_askyesno("提示", "检测仍在进行，确定要返回导入界面吗？", parent=self.root):
+                return
+            self.stop_detection()
+        if callable(self.on_back):
+            self.on_back()
+
+    def on_hide(self) -> None:
+        if self._running:
+            self.stop_detection()
+
+    def on_show(self) -> None:
+        self._update_detector_hint()
+
+    def _log(self, message: str) -> None:
+        log_add(self.log_text, message)
 
 def rollback_files(paths, target_root):
     removed = 0
@@ -1687,12 +3085,14 @@ def main_ui():
     if theme_key not in {DEFAULT_THEME_KEY}:
         theme_key = DEFAULT_THEME_KEY
 
+    enable_high_dpi_awareness()
     try:
         root = tk.Tk()
     except Exception:
         print("[提示] 无法初始化图形界面，自动切换到命令行模式。")
         run_cli(reason="无法初始化图形界面")
         return
+    set_tk_scaling(root)
     root.title(f"陈同学影像管理助手  {VERSION}")
     root.geometry("1180x760")
     root.minsize(960, 640)
@@ -1729,9 +3129,10 @@ def main_ui():
 
     header = ttk.Frame(root, style="AuroraHeader.TFrame", padding=(32, 26))
     header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=36, pady=(28, 16))
-    header.columnconfigure(0, weight=1)
+    header.grid_columnconfigure(0, weight=1)
+    header.grid_columnconfigure(3, weight=0)
     accent = ttk.Frame(header, style="AuroraAccent.TFrame", height=4)
-    accent.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 20))
+    accent.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 20))
     accent.grid_propagate(False)
     ttk.Label(header, text="照片/视频导入与分类", style="AuroraTitle.TLabel").grid(row=1, column=0, sticky="w")
     ttk.Label(header, text="主题", style="AuroraBodyOnPanel.TLabel").grid(row=1, column=1, sticky="e", padx=(24, 10))
@@ -1739,13 +3140,42 @@ def main_ui():
     theme_box.grid(row=1, column=2, sticky="e")
     theme_box.set(THEMES[0])
 
-    main_frame = ttk.Frame(root, style="AuroraPanel.TFrame")
-    main_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=36, pady=(0, 28))
-    main_frame.grid_columnconfigure(0, weight=1)
-    main_frame.grid_columnconfigure(1, weight=0)
-    main_frame.grid_rowconfigure(0, weight=1)
+    detect_btn = ttk.Button(header, text="检测废片", style="AuroraPrimary.TButton")
+    detect_btn.grid(row=1, column=3, sticky="e", padx=(18, 0))
 
-    right_col = ttk.Frame(main_frame, style="AuroraPanel.TFrame", width=LOG_PANEL_WIDTH)
+    content_container = ttk.Frame(root, style="AuroraPanel.TFrame")
+    content_container.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=36, pady=(0, 28))
+    content_container.grid_rowconfigure(0, weight=1)
+    content_container.grid_columnconfigure(0, weight=1)
+
+    import_frame = ttk.Frame(content_container, style="AuroraPanel.TFrame")
+    import_frame.grid(row=0, column=0, sticky="nsew")
+    import_frame.grid_columnconfigure(0, weight=1)
+    import_frame.grid_columnconfigure(1, weight=0)
+    import_frame.grid_rowconfigure(0, weight=1)
+
+    waste_frame = ttk.Frame(content_container, style="AuroraPanel.TFrame")
+    waste_frame.grid(row=0, column=0, sticky="nsew")
+    waste_frame.grid_remove()
+
+    waste_ui = WasteDetectionUI(root, waste_frame, theme_key, on_back=lambda: None)
+
+    def goto_import():
+        waste_ui.on_hide()
+        waste_frame.grid_remove()
+        import_frame.grid()
+        detect_btn.config(text="检测废片", command=goto_waste)
+
+    def goto_waste():
+        import_frame.grid_remove()
+        waste_frame.grid()
+        waste_ui.on_show()
+        detect_btn.config(text="返回导入界面", command=goto_import)
+
+    detect_btn.config(command=goto_waste)
+    waste_ui.on_back = goto_import
+
+    right_col = ttk.Frame(import_frame, style="AuroraPanel.TFrame", width=LOG_PANEL_WIDTH)
     right_col.grid(row=0, column=1, sticky="ns")
     right_col.grid_propagate(False)
     right_col.grid_rowconfigure(0, weight=1)
@@ -1762,7 +3192,7 @@ def main_ui():
     sb.grid(row=1, column=1, sticky="ns", padx=(16, 0))
     info_box.configure(yscrollcommand=sb.set)
 
-    left_col = ttk.Frame(main_frame, style="AuroraPanel.TFrame")
+    left_col = ttk.Frame(import_frame, style="AuroraPanel.TFrame")
     left_col.grid(row=0, column=0, sticky="nsew")
     left_col.grid_columnconfigure(0, weight=1)
 
@@ -2145,6 +3575,7 @@ def main_ui():
         save_config(cfg2)
         apply_theme(root, DEFAULT_THEME_KEY, info_text_widget=info_box)
         set_text_theme(info_box, DEFAULT_THEME_KEY)
+        waste_ui.apply_theme(DEFAULT_THEME_KEY)
 
     theme_box.bind("<<ComboboxSelected>>", on_theme_change)
 
